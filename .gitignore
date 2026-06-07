@@ -1,0 +1,11 @@
+.gradle/
+.kotlin/
+build/
+
+*.class
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+*.war
+*.ear
+
+out/
