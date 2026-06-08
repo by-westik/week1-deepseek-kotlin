@@ -19,6 +19,7 @@ private const val DEFAULT_MAX_TOKENS = 500
 data class ModelSettings(
     val maxTokens: Int = DEFAULT_MAX_TOKENS,
     val stop: String? = null,
+    val temperature: Double? = null,
 )
 
 fun main(args: Array<String>) {
@@ -55,6 +56,7 @@ fun main(args: Array<String>) {
 private fun parseArgs(args: Array<String>): ModelSettings {
     var maxTokens = DEFAULT_MAX_TOKENS
     var stop: String? = null
+    var temperature: Double? = null
     var index = 0
 
     while (index < args.size) {
@@ -85,11 +87,23 @@ private fun parseArgs(args: Array<String>): ModelSettings {
                 index++
             }
 
+            arg == "--temperature" -> {
+                val value = args.getOrNull(index + 1)
+                    ?: throw IllegalArgumentException("после --temperature нужно указать число")
+                temperature = parseTemperature(value)
+                index += 2
+            }
+
+            arg.startsWith("--temperature=") -> {
+                temperature = parseTemperature(arg.substringAfter("="))
+                index++
+            }
+
             else -> throw IllegalArgumentException("неизвестный аргумент: $arg")
         }
     }
 
-    return ModelSettings(maxTokens = maxTokens, stop = stop)
+    return ModelSettings(maxTokens = maxTokens, stop = stop, temperature = temperature)
 }
 
 private fun parseMaxTokens(value: String): Int {
@@ -101,6 +115,17 @@ private fun parseMaxTokens(value: String): Int {
     }
 
     return maxTokens
+}
+
+private fun parseTemperature(value: String): Double {
+    val temperature = value.toDoubleOrNull()
+        ?: throw IllegalArgumentException("--temperature должен быть числом")
+
+    if (temperature < 0.0 || temperature > 2.0) {
+        throw IllegalArgumentException("--temperature должен быть от 0 до 2")
+    }
+
+    return temperature
 }
 
 private fun readPrompt(): String {
@@ -135,6 +160,10 @@ private fun askDeepSeek(apiKey: String, userText: String, settings: ModelSetting
 
     if (settings.stop != null) {
         requestJson.put("stop", JSONArray().put(settings.stop))
+    }
+
+    if (settings.temperature != null) {
+        requestJson.put("temperature", settings.temperature)
     }
 
     val request = Request.Builder()
