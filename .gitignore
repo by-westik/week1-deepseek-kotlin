@@ -9,3 +9,6 @@ build/
 *.ear
 
 out/
+
+chat-history.json
+.day7-test-history.json

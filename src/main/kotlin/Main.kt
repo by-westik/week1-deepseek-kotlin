@@ -5,6 +5,8 @@ import okhttp3.MediaType.Companion.toMediaType
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
+import java.nio.file.Files
+import java.nio.file.Path
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 import kotlin.system.exitProcess
@@ -13,9 +15,15 @@ private const val API_URL = "https://api.deepseek.com/chat/completions"
 private const val DEFAULT_MODEL = "deepseek-v4-flash"
 private const val DEFAULT_THINKING = "disabled"
 private const val DEFAULT_MAX_TOKENS = 500
+private const val DEFAULT_HISTORY_FILE = "chat-history.json"
 private const val TOKENS_PER_MILLION = 1_000_000.0
 
 private val EXIT_COMMANDS = setOf("/exit", "/quit", "exit", "quit", "выход")
+
+data class AppSettings(
+    val modelSettings: ModelSettings = ModelSettings(),
+    val historyPath: Path = Path.of(DEFAULT_HISTORY_FILE),
+)
 
 data class ModelSettings(
     val model: String = DEFAULT_MODEL,
@@ -82,8 +90,12 @@ data class ChatMessage(
 class DeepSeekAgent(
     private val client: DeepSeekClient,
     private val settings: ModelSettings,
+    private val messageStore: MessageStore,
 ) {
-    private val messages = mutableListOf<ChatMessage>()
+    private val messages = messageStore.load().toMutableList()
+
+    val messageCount: Int
+        get() = messages.size
 
     fun ask(userText: String): ModelResponse {
         val userMessage = ChatMessage(role = "user", content = userText)
@@ -91,8 +103,42 @@ class DeepSeekAgent(
 
         messages += userMessage
         messages += ChatMessage(role = "assistant", content = response.answer)
+        messageStore.save(messages)
 
         return response
+    }
+}
+
+interface MessageStore {
+    fun load(): List<ChatMessage>
+    fun save(messages: List<ChatMessage>)
+}
+
+class JsonMessageStore(private val path: Path) : MessageStore {
+    override fun load(): List<ChatMessage> {
+        if (!Files.exists(path)) {
+            return emptyList()
+        }
+
+        val historyJson = JSONArray(Files.readString(path))
+        val messages = mutableListOf<ChatMessage>()
+
+        for (index in 0 until historyJson.length()) {
+            val messageJson = historyJson.getJSONObject(index)
+            val role = messageJson.optString("role").trim()
+            val content = messageJson.optString("content").trim()
+
+            if (role.isNotBlank() && content.isNotBlank()) {
+                messages += ChatMessage(role = role, content = content)
+            }
+        }
+
+        return messages
+    }
+
+    override fun save(messages: List<ChatMessage>) {
+        path.parent?.let { Files.createDirectories(it) }
+        Files.writeString(path, messages.toJson().toString(2))
     }
 }
 
@@ -187,21 +233,25 @@ fun main(args: Array<String>) {
         exitProcess(1)
     }
 
-    val settings = try {
+    val appSettings = try {
         parseArgs(args)
     } catch (error: IllegalArgumentException) {
         System.err.println("Ошибка: ${error.message}")
         exitProcess(1)
     }
+    val settings = appSettings.modelSettings
 
     val agent = DeepSeekAgent(
         client = DeepSeekClient(apiKey),
         settings = settings,
+        messageStore = JsonMessageStore(appSettings.historyPath),
     )
     var dialogStats = DialogStats()
 
     println("DeepSeek Agent")
     println("Введите сообщение. Для выхода: /exit, /quit или пустой EOF.")
+    println("История: ${appSettings.historyPath.toAbsolutePath()}")
+    println("Загружено сообщений из истории: ${agent.messageCount}")
     println()
 
     while (true) {
@@ -234,12 +284,13 @@ fun main(args: Array<String>) {
     printDialogStats(settings, dialogStats)
 }
 
-private fun parseArgs(args: Array<String>): ModelSettings {
+private fun parseArgs(args: Array<String>): AppSettings {
     var model = DEFAULT_MODEL
     var thinking = DEFAULT_THINKING
     var maxTokens = DEFAULT_MAX_TOKENS
     var stop: String? = null
     var temperature: Double? = null
+    var historyPath = Path.of(DEFAULT_HISTORY_FILE)
     var index = 0
 
     while (index < args.size) {
@@ -306,16 +357,31 @@ private fun parseArgs(args: Array<String>): ModelSettings {
                 index++
             }
 
+            arg == "--history-file" -> {
+                val value = args.getOrNull(index + 1)
+                    ?: throw IllegalArgumentException("после --history-file нужно указать путь к JSON-файлу")
+                historyPath = parseHistoryPath(value)
+                index += 2
+            }
+
+            arg.startsWith("--history-file=") -> {
+                historyPath = parseHistoryPath(arg.substringAfter("="))
+                index++
+            }
+
             else -> throw IllegalArgumentException("неизвестный аргумент: $arg")
         }
     }
 
-    return ModelSettings(
-        model = model,
-        thinking = thinking,
-        maxTokens = maxTokens,
-        stop = stop,
-        temperature = temperature,
+    return AppSettings(
+        modelSettings = ModelSettings(
+            model = model,
+            thinking = thinking,
+            maxTokens = maxTokens,
+            stop = stop,
+            temperature = temperature,
+        ),
+        historyPath = historyPath,
     )
 }
 
@@ -357,6 +423,16 @@ private fun parseTemperature(value: String): Double {
     }
 
     return temperature
+}
+
+private fun parseHistoryPath(value: String): Path {
+    val path = value.trim()
+
+    if (path.isBlank()) {
+        throw IllegalArgumentException("--history-file не должен быть пустым")
+    }
+
+    return Path.of(path)
 }
 
 private fun List<ChatMessage>.toJson(): JSONArray {
