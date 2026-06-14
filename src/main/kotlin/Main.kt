@@ -5,8 +5,6 @@ import okhttp3.MediaType.Companion.toMediaType
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
-import java.nio.file.Files
-import java.nio.file.Path
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 import kotlin.system.exitProcess
@@ -14,10 +12,10 @@ import kotlin.system.exitProcess
 private const val API_URL = "https://api.deepseek.com/chat/completions"
 private const val DEFAULT_MODEL = "deepseek-v4-flash"
 private const val DEFAULT_THINKING = "disabled"
-private const val PROMPT_ENV = "DEEPSEEK_PROMPT"
-private const val PROMPT_FILE = "prompt.txt"
 private const val DEFAULT_MAX_TOKENS = 500
 private const val TOKENS_PER_MILLION = 1_000_000.0
+
+private val EXIT_COMMANDS = setOf("/exit", "/quit", "exit", "quit", "выход")
 
 data class ModelSettings(
     val model: String = DEFAULT_MODEL,
@@ -47,6 +45,124 @@ data class ModelResponse(
     val elapsedMillis: Long,
     val estimatedCost: Double,
 )
+
+data class DialogStats(
+    val responseCount: Int = 0,
+    val elapsedMillis: Long = 0,
+    val promptTokens: Int = 0,
+    val completionTokens: Int = 0,
+    val totalTokens: Int = 0,
+    val promptCacheHitTokens: Int = 0,
+    val promptCacheMissTokens: Int = 0,
+    val hasCacheStats: Boolean = false,
+    val estimatedCost: Double = 0.0,
+) {
+    fun plus(response: ModelResponse): DialogStats {
+        val usage = response.usage
+
+        return copy(
+            responseCount = responseCount + 1,
+            elapsedMillis = elapsedMillis + response.elapsedMillis,
+            promptTokens = promptTokens + usage.promptTokens,
+            completionTokens = completionTokens + usage.completionTokens,
+            totalTokens = totalTokens + usage.totalTokens,
+            promptCacheHitTokens = promptCacheHitTokens + (usage.promptCacheHitTokens ?: 0),
+            promptCacheMissTokens = promptCacheMissTokens + (usage.promptCacheMissTokens ?: 0),
+            hasCacheStats = hasCacheStats || usage.promptCacheHitTokens != null || usage.promptCacheMissTokens != null,
+            estimatedCost = estimatedCost + response.estimatedCost,
+        )
+    }
+}
+
+data class ChatMessage(
+    val role: String,
+    val content: String,
+)
+
+class DeepSeekAgent(
+    private val client: DeepSeekClient,
+    private val settings: ModelSettings,
+) {
+    private val messages = mutableListOf<ChatMessage>()
+
+    fun ask(userText: String): ModelResponse {
+        val userMessage = ChatMessage(role = "user", content = userText)
+        val response = client.complete(messages + userMessage, settings)
+
+        messages += userMessage
+        messages += ChatMessage(role = "assistant", content = response.answer)
+
+        return response
+    }
+}
+
+class DeepSeekClient(private val apiKey: String) {
+    private val httpClient = OkHttpClient.Builder()
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(120, TimeUnit.SECONDS)
+        .callTimeout(150, TimeUnit.SECONDS)
+        .build()
+
+    private val jsonType = "application/json; charset=utf-8".toMediaType()
+
+    fun complete(messages: List<ChatMessage>, settings: ModelSettings): ModelResponse {
+        val requestJson = JSONObject()
+            .put("model", settings.model)
+            .put("messages", messages.toJson())
+            .put("thinking", JSONObject().put("type", settings.thinking))
+            .put("max_tokens", settings.maxTokens)
+            .put("stream", false)
+
+        if (settings.stop != null) {
+            requestJson.put("stop", JSONArray().put(settings.stop))
+        }
+
+        if (settings.temperature != null) {
+            requestJson.put("temperature", settings.temperature)
+        }
+
+        val request = Request.Builder()
+            .url(API_URL)
+            .addHeader("Authorization", "Bearer $apiKey")
+            .addHeader("Content-Type", "application/json")
+            .post(requestJson.toString().toRequestBody(jsonType))
+            .build()
+
+        val startedAt = System.nanoTime()
+
+        httpClient.newCall(request).execute().use { response ->
+            val elapsedMillis = (System.nanoTime() - startedAt) / 1_000_000
+            val responseText = response.body?.string().orEmpty()
+
+            if (!response.isSuccessful) {
+                throw IOException("HTTP ${response.code}: $responseText")
+            }
+
+            val responseJson = JSONObject(responseText)
+            val answer = responseJson
+                .getJSONArray("choices")
+                .getJSONObject(0)
+                .getJSONObject("message")
+                .optString("content")
+                .trim()
+
+            if (answer.isBlank()) {
+                throw IOException("модель вернула пустой ответ")
+            }
+
+            val usage = parseUsage(responseJson)
+            val estimatedCost = calculateCost(settings.model, usage)
+
+            return ModelResponse(
+                answer = answer,
+                usage = usage,
+                elapsedMillis = elapsedMillis,
+                estimatedCost = estimatedCost,
+            )
+        }
+    }
+}
 
 private val SUPPORTED_MODELS = setOf("deepseek-v4-flash", "deepseek-v4-pro")
 
@@ -78,22 +194,44 @@ fun main(args: Array<String>) {
         exitProcess(1)
     }
 
-    val userText = readPrompt()
+    val agent = DeepSeekAgent(
+        client = DeepSeekClient(apiKey),
+        settings = settings,
+    )
+    var dialogStats = DialogStats()
 
-    if (userText.isBlank()) {
-        System.err.println("Ошибка: задайте запрос в переменной $PROMPT_ENV или в файле $PROMPT_FILE")
-        exitProcess(1)
+    println("DeepSeek Agent")
+    println("Введите сообщение. Для выхода: /exit, /quit или пустой EOF.")
+    println()
+
+    while (true) {
+        print("Вы: ")
+        val input = readLine() ?: break
+        val userText = input.trim()
+
+        if (userText.isBlank()) {
+            continue
+        }
+
+        if (userText in EXIT_COMMANDS) {
+            println("Диалог завершен.")
+            break
+        }
+
+        try {
+            val response = agent.ask(userText)
+            dialogStats = dialogStats.plus(response)
+            println()
+            println("Агент: ${response.answer}")
+            println()
+        } catch (error: Exception) {
+            System.err.println("Ошибка: ${error.message}")
+            println()
+        }
     }
 
-    try {
-        val response = askDeepSeek(apiKey, userText, settings)
-        println(response.answer)
-        println()
-        printStats(settings, response)
-    } catch (error: Exception) {
-        System.err.println("Ошибка: ${error.message}")
-        exitProcess(1)
-    }
+    println()
+    printDialogStats(settings, dialogStats)
 }
 
 private fun parseArgs(args: Array<String>): ModelSettings {
@@ -221,83 +359,18 @@ private fun parseTemperature(value: String): Double {
     return temperature
 }
 
-private fun readPrompt(): String {
-    val promptFromEnv = System.getenv(PROMPT_ENV)
-    if (!promptFromEnv.isNullOrBlank()) {
-        return promptFromEnv.trim()
-    }
+private fun List<ChatMessage>.toJson(): JSONArray {
+    val messagesJson = JSONArray()
 
-    val promptPath = Path.of(PROMPT_FILE)
-    if (Files.exists(promptPath)) {
-        return Files.readString(promptPath).trim()
-    }
-
-    return ""
-}
-
-private fun askDeepSeek(apiKey: String, userText: String, settings: ModelSettings): ModelResponse {
-    val client = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(120, TimeUnit.SECONDS)
-        .callTimeout(150, TimeUnit.SECONDS)
-        .build()
-    val jsonType = "application/json; charset=utf-8".toMediaType()
-
-    val requestJson = JSONObject()
-        .put("model", settings.model)
-        .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", userText)))
-        .put("thinking", JSONObject().put("type", settings.thinking))
-        .put("max_tokens", settings.maxTokens)
-        .put("stream", false)
-
-    if (settings.stop != null) {
-        requestJson.put("stop", JSONArray().put(settings.stop))
-    }
-
-    if (settings.temperature != null) {
-        requestJson.put("temperature", settings.temperature)
-    }
-
-    val request = Request.Builder()
-        .url(API_URL)
-        .addHeader("Authorization", "Bearer $apiKey")
-        .addHeader("Content-Type", "application/json")
-        .post(requestJson.toString().toRequestBody(jsonType))
-        .build()
-
-    val startedAt = System.nanoTime()
-
-    client.newCall(request).execute().use { response ->
-        val elapsedMillis = (System.nanoTime() - startedAt) / 1_000_000
-        val responseText = response.body?.string().orEmpty()
-
-        if (!response.isSuccessful) {
-            throw IOException("HTTP ${response.code}: $responseText")
-        }
-
-        val responseJson = JSONObject(responseText)
-        val answer = responseJson
-            .getJSONArray("choices")
-            .getJSONObject(0)
-            .getJSONObject("message")
-            .optString("content")
-            .trim()
-
-        if (answer.isBlank()) {
-            throw IOException("модель вернула пустой ответ")
-        }
-
-        val usage = parseUsage(responseJson)
-        val estimatedCost = calculateCost(settings.model, usage)
-
-        return ModelResponse(
-            answer = answer,
-            usage = usage,
-            elapsedMillis = elapsedMillis,
-            estimatedCost = estimatedCost,
+    forEach { message ->
+        messagesJson.put(
+            JSONObject()
+                .put("role", message.role)
+                .put("content", message.content),
         )
     }
+
+    return messagesJson
 }
 
 private fun parseUsage(responseJson: JSONObject): TokenUsage {
@@ -342,23 +415,22 @@ private fun calculateCost(model: String, usage: TokenUsage): Double {
     return inputCost + outputCost
 }
 
-private fun printStats(settings: ModelSettings, response: ModelResponse) {
-    val usage = response.usage
-
-    println("=== Статистика ===")
+private fun printDialogStats(settings: ModelSettings, stats: DialogStats) {
+    println("=== Статистика диалога ===")
     println("Модель: ${settings.model}")
     println("Thinking mode: ${settings.thinking}")
-    println("Время ответа: ${formatSeconds(response.elapsedMillis)} сек")
-    println("Prompt tokens: ${usage.promptTokens}")
-    println("Completion tokens: ${usage.completionTokens}")
-    println("Total tokens: ${usage.totalTokens}")
+    println("Ответов агента: ${stats.responseCount}")
+    println("Общее время ответов: ${formatSeconds(stats.elapsedMillis)} сек")
+    println("Prompt tokens: ${stats.promptTokens}")
+    println("Completion tokens: ${stats.completionTokens}")
+    println("Total tokens: ${stats.totalTokens}")
 
-    if (usage.promptCacheHitTokens != null || usage.promptCacheMissTokens != null) {
-        println("Prompt cache hit tokens: ${usage.promptCacheHitTokens ?: 0}")
-        println("Prompt cache miss tokens: ${usage.promptCacheMissTokens ?: 0}")
+    if (stats.hasCacheStats) {
+        println("Prompt cache hit tokens: ${stats.promptCacheHitTokens}")
+        println("Prompt cache miss tokens: ${stats.promptCacheMissTokens}")
     }
 
-    println("Примерная стоимость: ${formatUsd(response.estimatedCost)}")
+    println("Примерная стоимость: ${formatUsd(stats.estimatedCost)}")
 }
 
 private fun formatSeconds(milliseconds: Long): String {
