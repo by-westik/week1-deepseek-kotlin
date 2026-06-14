@@ -23,6 +23,8 @@ private val EXIT_COMMANDS = setOf("/exit", "/quit", "exit", "quit", "выход"
 data class AppSettings(
     val modelSettings: ModelSettings = ModelSettings(),
     val historyPath: Path = Path.of(DEFAULT_HISTORY_FILE),
+    val allowOverLimit: Boolean = false,
+    val dryRunTokens: Boolean = false,
 )
 
 data class ModelSettings(
@@ -37,6 +39,10 @@ data class ModelPricing(
     val inputCacheHitPerMillion: Double,
     val inputCacheMissPerMillion: Double,
     val outputPerMillion: Double,
+)
+
+data class ModelLimit(
+    val contextTokens: Int,
 )
 
 data class TokenUsage(
@@ -82,20 +88,79 @@ data class DialogStats(
     }
 }
 
+data class TokenReport(
+    val currentRequestTokens: Int,
+    val historyTokens: Int,
+    val promptTokens: Int,
+    val maxResponseTokens: Int,
+    val projectedTotalTokens: Int,
+    val contextLimit: Int,
+) {
+    val isOverLimit: Boolean
+        get() = projectedTotalTokens > contextLimit
+
+    val usagePercent: Double
+        get() = projectedTotalTokens.toDouble() / contextLimit * 100.0
+}
+
 data class ChatMessage(
     val role: String,
     val content: String,
 )
 
+interface TokenCounter {
+    fun countText(text: String): Int
+    fun countMessage(message: ChatMessage): Int
+    fun countMessages(messages: List<ChatMessage>): Int
+}
+
+class SimpleTokenCounter : TokenCounter {
+    private val tokenRegex = Regex("""[\p{L}_]+|\p{N}+|[^\s\p{L}\p{N}_]""")
+
+    override fun countText(text: String): Int {
+        return tokenRegex.findAll(text).count()
+    }
+
+    override fun countMessage(message: ChatMessage): Int {
+        return MESSAGE_OVERHEAD_TOKENS + countText(message.role) + countText(message.content)
+    }
+
+    override fun countMessages(messages: List<ChatMessage>): Int {
+        return messages.sumOf(::countMessage)
+    }
+
+    private companion object {
+        const val MESSAGE_OVERHEAD_TOKENS = 4
+    }
+}
+
 class DeepSeekAgent(
     private val client: DeepSeekClient,
     private val settings: ModelSettings,
     private val messageStore: MessageStore,
+    private val tokenCounter: TokenCounter,
 ) {
     private val messages = messageStore.load().toMutableList()
 
     val messageCount: Int
         get() = messages.size
+
+    fun previewTokens(userText: String): TokenReport {
+        val userMessage = ChatMessage(role = "user", content = userText)
+        val currentRequestTokens = tokenCounter.countMessage(userMessage)
+        val historyTokens = tokenCounter.countMessages(messages)
+        val promptTokens = historyTokens + currentRequestTokens
+        val contextLimit = MODEL_LIMITS.getValue(settings.model).contextTokens
+
+        return TokenReport(
+            currentRequestTokens = currentRequestTokens,
+            historyTokens = historyTokens,
+            promptTokens = promptTokens,
+            maxResponseTokens = settings.maxTokens,
+            projectedTotalTokens = promptTokens + settings.maxTokens,
+            contextLimit = contextLimit,
+        )
+    }
 
     fun ask(userText: String): ModelResponse {
         val userMessage = ChatMessage(role = "user", content = userText)
@@ -212,6 +277,11 @@ class DeepSeekClient(private val apiKey: String) {
 
 private val SUPPORTED_MODELS = setOf("deepseek-v4-flash", "deepseek-v4-pro")
 
+private val MODEL_LIMITS = mapOf(
+    "deepseek-v4-flash" to ModelLimit(contextTokens = 1_048_576),
+    "deepseek-v4-pro" to ModelLimit(contextTokens = 1_048_576),
+)
+
 private val MODEL_PRICING = mapOf(
     "deepseek-v4-flash" to ModelPricing(
         inputCacheHitPerMillion = 0.0028,
@@ -245,6 +315,7 @@ fun main(args: Array<String>) {
         client = DeepSeekClient(apiKey),
         settings = settings,
         messageStore = JsonMessageStore(appSettings.historyPath),
+        tokenCounter = SimpleTokenCounter(),
     )
     var dialogStats = DialogStats()
 
@@ -269,10 +340,28 @@ fun main(args: Array<String>) {
         }
 
         try {
+            val tokenReport = agent.previewTokens(userText)
+            printTokenReport(tokenReport)
+
+            if (tokenReport.isOverLimit && !appSettings.allowOverLimit) {
+                println("Запрос не отправлен: прогноз превышает лимит модели.")
+                println("Добавьте --allow-over-limit, если хотите отправить запрос и увидеть ошибку API на практике.")
+                println()
+                continue
+            }
+
+            if (appSettings.dryRunTokens) {
+                println("Dry run: запрос не отправлен в API.")
+                println()
+                continue
+            }
+
             val response = agent.ask(userText)
             dialogStats = dialogStats.plus(response)
             println()
             println("Агент: ${response.answer}")
+            println()
+            printResponseTokenStats(response, dialogStats)
             println()
         } catch (error: Exception) {
             System.err.println("Ошибка: ${error.message}")
@@ -291,6 +380,8 @@ private fun parseArgs(args: Array<String>): AppSettings {
     var stop: String? = null
     var temperature: Double? = null
     var historyPath = Path.of(DEFAULT_HISTORY_FILE)
+    var allowOverLimit = false
+    var dryRunTokens = false
     var index = 0
 
     while (index < args.size) {
@@ -369,6 +460,16 @@ private fun parseArgs(args: Array<String>): AppSettings {
                 index++
             }
 
+            arg == "--allow-over-limit" -> {
+                allowOverLimit = true
+                index++
+            }
+
+            arg == "--dry-run-tokens" -> {
+                dryRunTokens = true
+                index++
+            }
+
             else -> throw IllegalArgumentException("неизвестный аргумент: $arg")
         }
     }
@@ -382,6 +483,8 @@ private fun parseArgs(args: Array<String>): AppSettings {
             temperature = temperature,
         ),
         historyPath = historyPath,
+        allowOverLimit = allowOverLimit,
+        dryRunTokens = dryRunTokens,
     )
 }
 
@@ -509,8 +612,41 @@ private fun printDialogStats(settings: ModelSettings, stats: DialogStats) {
     println("Примерная стоимость: ${formatUsd(stats.estimatedCost)}")
 }
 
+private fun printTokenReport(report: TokenReport) {
+    println()
+    println("=== Токены перед запросом ===")
+    println("Текущий запрос: ${report.currentRequestTokens}")
+    println("История диалога: ${report.historyTokens}")
+    println("Prompt всего: ${report.promptTokens}")
+    println("Max response tokens: ${report.maxResponseTokens}")
+    println("Prompt + максимум ответа: ${report.projectedTotalTokens}")
+    println("Лимит модели: ${report.contextLimit}")
+    println("Использование лимита: ${formatPercent(report.usagePercent)}")
+
+    if (report.isOverLimit) {
+        println("Статус: превышение лимита")
+    } else {
+        println("Статус: в пределах лимита")
+    }
+}
+
+private fun printResponseTokenStats(response: ModelResponse, dialogStats: DialogStats) {
+    val usage = response.usage
+
+    println("=== Факт по ответу API ===")
+    println("Prompt tokens: ${usage.promptTokens}")
+    println("Completion tokens: ${usage.completionTokens}")
+    println("Total tokens: ${usage.totalTokens}")
+    println("Стоимость этого шага: ${formatUsd(response.estimatedCost)}")
+    println("Накопленная стоимость диалога: ${formatUsd(dialogStats.estimatedCost)}")
+}
+
 private fun formatSeconds(milliseconds: Long): String {
     return String.format(Locale.US, "%.2f", milliseconds / 1000.0)
+}
+
+private fun formatPercent(value: Double): String {
+    return String.format(Locale.US, "%.2f%%", value)
 }
 
 private fun formatUsd(value: Double): String {
