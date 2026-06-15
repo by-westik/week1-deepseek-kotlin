@@ -12,7 +12,12 @@ out/
 
 chat-history.json
 chat-summary.txt
+chat-facts.json
+chat-branches/
 .day7-test-history.json
 .day8-live-history.json
 .day9-*.json
 .day9-*.txt
+.day10-*.json
+.day10-*.txt
+.day10-branches/

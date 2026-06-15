@@ -24,19 +24,27 @@ fun main(args: Array<String>) {
     } else {
         DeepSeekConversationSummarizer(client = client, settings = settings)
     }
+    val branchStore = if (appSettings.contextStrategy == ContextStrategyType.BRANCHING) {
+        BranchingMessageStore(
+            branchDir = appSettings.branchDir,
+            initialBranch = appSettings.branchName,
+            fallbackHistoryPath = appSettings.historyPath,
+        )
+    } else {
+        null
+    }
+    val messageStore = branchStore ?: JsonMessageStore(appSettings.historyPath)
+    val contextManager = buildContextManager(
+        appSettings = appSettings,
+        summarizer = summarizer,
+    )
 
     val agent = DeepSeekAgent(
         client = client,
         settings = settings,
-        messageStore = JsonMessageStore(appSettings.historyPath),
+        messageStore = messageStore,
         tokenCounter = tokenCounter,
-        contextCompressor = ContextCompressor(
-            enabled = appSettings.compressionEnabled,
-            recentMessages = appSettings.recentMessages,
-            summaryChunkSize = appSettings.summaryChunkSize,
-            summaryStore = TextSummaryStore(appSettings.summaryPath),
-            summarizer = summarizer,
-        ),
+        contextManager = contextManager,
     )
     var dialogStats = DialogStats()
 
@@ -44,11 +52,19 @@ fun main(args: Array<String>) {
     println("Введите сообщение. Для выхода: /exit, /quit или пустой EOF.")
     println("История: ${appSettings.historyPath.toAbsolutePath()}")
     println("Загружено сообщений из истории: ${agent.messageCount}")
-    if (appSettings.compressionEnabled) {
+    println("Стратегия контекста: ${appSettings.contextStrategy.name.lowercase()}")
+    if (branchStore != null) {
+        println("Активная ветка: ${branchStore.activeBranch}")
+        println("Папка веток: ${appSettings.branchDir.toAbsolutePath()}")
+    }
+    if (appSettings.contextStrategy == ContextStrategyType.SUMMARY) {
         println("Компрессия контекста: включена")
         println("Последние сообщения без сжатия: ${appSettings.recentMessages}")
         println("Summary: ${appSettings.summaryPath.toAbsolutePath()}")
         println("Размер summary: ${tokenCounter.countText(agent.summaryText)} токенов")
+    } else if (appSettings.contextStrategy == ContextStrategyType.FACTS) {
+        println("Facts: ${appSettings.factsPath.toAbsolutePath()}")
+        println("Facts tokens: ${tokenCounter.countText(agent.summaryText)}")
     } else {
         println("Компрессия контекста: выключена")
     }
@@ -57,21 +73,25 @@ fun main(args: Array<String>) {
         if (appSettings.compactNow) {
             val remainingMessages = agent.compactHistoryNow()
             println("История сжата. Сообщений осталось в JSON: $remainingMessages")
-            println("Summary обновлен: ${appSettings.summaryPath.toAbsolutePath()}")
+            if (appSettings.contextStrategy == ContextStrategyType.SUMMARY) {
+                println("Summary обновлен: ${appSettings.summaryPath.toAbsolutePath()}")
+            }
             return
         }
 
-        val messagesBeforeStartupCompact = agent.messageCount
-        val remainingMessages = try {
-            agent.compactHistoryIfNeeded()
-        } catch (error: Exception) {
-            System.err.println("Ошибка сжатия истории: ${error.message}")
-            null
-        }
+        if (appSettings.contextStrategy == ContextStrategyType.SUMMARY) {
+            val messagesBeforeStartupCompact = agent.messageCount
+            val remainingMessages = try {
+                agent.compactHistoryIfNeeded()
+            } catch (error: Exception) {
+                System.err.println("Ошибка сжатия истории: ${error.message}")
+                null
+            }
 
-        if (remainingMessages != null && remainingMessages != messagesBeforeStartupCompact) {
-            println("История сжата при старте. Сообщений осталось в JSON: $remainingMessages")
-            println("Summary обновлен: ${appSettings.summaryPath.toAbsolutePath()}")
+            if (remainingMessages != null && remainingMessages != messagesBeforeStartupCompact) {
+                println("История сжата при старте. Сообщений осталось в JSON: $remainingMessages")
+                println("Summary обновлен: ${appSettings.summaryPath.toAbsolutePath()}")
+            }
         }
 
         while (true) {
@@ -86,6 +106,10 @@ fun main(args: Array<String>) {
         if (userText in EXIT_COMMANDS) {
             println("Диалог завершен.")
             break
+        }
+
+        if (branchStore != null && handleBranchCommand(userText, branchStore, agent)) {
+            continue
         }
 
         try {
@@ -122,6 +146,67 @@ fun main(args: Array<String>) {
     printDialogStats(settings, dialogStats)
 }
 
+private fun buildContextManager(
+    appSettings: AppSettings,
+    summarizer: ConversationSummarizer,
+): ContextManager {
+    return when (appSettings.contextStrategy) {
+        ContextStrategyType.FULL -> FullContextManager()
+        ContextStrategyType.SLIDING -> SlidingWindowContextManager(appSettings.recentMessages)
+        ContextStrategyType.FACTS -> FactsContextManager(
+            recentMessages = appSettings.recentMessages,
+            factsStore = JsonFactsStore(appSettings.factsPath),
+        )
+        ContextStrategyType.BRANCHING -> FullContextManager()
+        ContextStrategyType.SUMMARY -> ContextCompressor(
+            enabled = true,
+            recentMessages = appSettings.recentMessages,
+            summaryChunkSize = appSettings.summaryChunkSize,
+            summaryStore = TextSummaryStore(appSettings.summaryPath),
+            summarizer = summarizer,
+        )
+    }
+}
+
+private fun handleBranchCommand(
+    input: String,
+    branchStore: BranchingMessageStore,
+    agent: DeepSeekAgent,
+): Boolean {
+    val parts = input.split(Regex("\\s+")).filter { it.isNotBlank() }
+
+    if (parts.isEmpty()) {
+        return false
+    }
+
+    return when {
+        parts[0] == "/checkpoint" && parts.size == 2 -> {
+            branchStore.checkpoint(parts[1], agent.currentMessages())
+            println("Checkpoint сохранен: ${parts[1]}")
+            true
+        }
+        parts[0] == "/branch" && parts.getOrNull(1) == "create" && parts.size == 4 -> {
+            branchStore.createBranch(branchName = parts[2], checkpointName = parts[3])
+            agent.reloadMessages()
+            println("Создана и выбрана ветка: ${parts[2]}")
+            true
+        }
+        parts[0] == "/branch" && parts.getOrNull(1) == "switch" && parts.size == 3 -> {
+            branchStore.switchBranch(parts[2])
+            agent.reloadMessages()
+            println("Активная ветка: ${parts[2]}")
+            true
+        }
+        parts[0] == "/branch" && parts.getOrNull(1) == "list" -> {
+            val branches = branchStore.listBranches()
+            println("Ветки: ${branches.ifEmpty { listOf("(пока нет)") }.joinToString(", ")}")
+            println("Активная ветка: ${branchStore.activeBranch}")
+            true
+        }
+        else -> false
+    }
+}
+
 private fun parseArgs(args: Array<String>): AppSettings {
     var model = DEFAULT_MODEL
     var thinking = DEFAULT_THINKING
@@ -130,6 +215,10 @@ private fun parseArgs(args: Array<String>): AppSettings {
     var temperature: Double? = null
     var historyPath = Path.of(DEFAULT_HISTORY_FILE)
     var summaryPath = Path.of(DEFAULT_SUMMARY_FILE)
+    var factsPath = Path.of(DEFAULT_FACTS_FILE)
+    var branchDir = Path.of(DEFAULT_BRANCH_DIR)
+    var branchName = DEFAULT_BRANCH_NAME
+    var contextStrategy = ContextStrategyType.FULL
     var allowOverLimit = false
     var dryRunTokens = false
     var compressionEnabled = false
@@ -226,6 +315,21 @@ private fun parseArgs(args: Array<String>): AppSettings {
 
             arg == "--compress-context" -> {
                 compressionEnabled = true
+                contextStrategy = ContextStrategyType.SUMMARY
+                index++
+            }
+
+            arg == "--context-strategy" -> {
+                val value = args.getOrNull(index + 1)
+                    ?: throw IllegalArgumentException("после --context-strategy нужно указать full, summary, sliding, facts или branching")
+                contextStrategy = parseContextStrategy(value)
+                compressionEnabled = contextStrategy == ContextStrategyType.SUMMARY
+                index += 2
+            }
+
+            arg.startsWith("--context-strategy=") -> {
+                contextStrategy = parseContextStrategy(arg.substringAfter("="))
+                compressionEnabled = contextStrategy == ContextStrategyType.SUMMARY
                 index++
             }
 
@@ -250,6 +354,42 @@ private fun parseArgs(args: Array<String>): AppSettings {
 
             arg.startsWith("--summary-file=") -> {
                 summaryPath = parseSummaryPath(arg.substringAfter("="))
+                index++
+            }
+
+            arg == "--facts-file" -> {
+                val value = args.getOrNull(index + 1)
+                    ?: throw IllegalArgumentException("после --facts-file нужно указать путь к JSON-файлу")
+                factsPath = parsePath(value, "--facts-file")
+                index += 2
+            }
+
+            arg.startsWith("--facts-file=") -> {
+                factsPath = parsePath(arg.substringAfter("="), "--facts-file")
+                index++
+            }
+
+            arg == "--branch-dir" -> {
+                val value = args.getOrNull(index + 1)
+                    ?: throw IllegalArgumentException("после --branch-dir нужно указать путь к папке")
+                branchDir = parsePath(value, "--branch-dir")
+                index += 2
+            }
+
+            arg.startsWith("--branch-dir=") -> {
+                branchDir = parsePath(arg.substringAfter("="), "--branch-dir")
+                index++
+            }
+
+            arg == "--branch" -> {
+                val value = args.getOrNull(index + 1)
+                    ?: throw IllegalArgumentException("после --branch нужно указать имя ветки")
+                branchName = parseName(value, "--branch")
+                index += 2
+            }
+
+            arg.startsWith("--branch=") -> {
+                branchName = parseName(arg.substringAfter("="), "--branch")
                 index++
             }
 
@@ -285,6 +425,10 @@ private fun parseArgs(args: Array<String>): AppSettings {
         ),
         historyPath = historyPath,
         summaryPath = summaryPath,
+        factsPath = factsPath,
+        branchDir = branchDir,
+        branchName = branchName,
+        contextStrategy = contextStrategy,
         allowOverLimit = allowOverLimit,
         dryRunTokens = dryRunTokens,
         compressionEnabled = compressionEnabled,
@@ -292,6 +436,17 @@ private fun parseArgs(args: Array<String>): AppSettings {
         summaryChunkSize = summaryChunkSize,
         compactNow = compactNow,
     )
+}
+
+private fun parseContextStrategy(value: String): ContextStrategyType {
+    return when (value.trim().lowercase()) {
+        "full", "none" -> ContextStrategyType.FULL
+        "summary", "compress", "compression" -> ContextStrategyType.SUMMARY
+        "sliding", "sliding-window", "window" -> ContextStrategyType.SLIDING
+        "facts", "sticky-facts", "memory" -> ContextStrategyType.FACTS
+        "branching", "branches", "branch" -> ContextStrategyType.BRANCHING
+        else -> throw IllegalArgumentException("--context-strategy должен быть full, summary, sliding, facts или branching")
+    }
 }
 
 private fun parseModel(value: String): String {
@@ -345,13 +500,27 @@ private fun parseHistoryPath(value: String): Path {
 }
 
 private fun parseSummaryPath(value: String): Path {
+    return parsePath(value, "--summary-file")
+}
+
+private fun parsePath(value: String, optionName: String): Path {
     val path = value.trim()
 
     if (path.isBlank()) {
-        throw IllegalArgumentException("--summary-file не должен быть пустым")
+        throw IllegalArgumentException("$optionName не должен быть пустым")
     }
 
     return Path.of(path)
+}
+
+private fun parseName(value: String, optionName: String): String {
+    val name = value.trim()
+
+    if (name.isBlank()) {
+        throw IllegalArgumentException("$optionName не должен быть пустым")
+    }
+
+    return name
 }
 
 private fun parsePositiveInt(value: String, optionName: String): Int {
@@ -386,11 +555,11 @@ private fun printDialogStats(settings: ModelSettings, stats: DialogStats) {
 private fun printTokenReport(report: TokenReport) {
     println()
     println("=== Токены перед запросом ===")
-    println("Компрессия: ${if (report.compressionEnabled) "включена" else "выключена"}")
+    println("Управление контекстом: ${if (report.compressionEnabled) "включено" else "выключено"}")
     println("Сообщений в сохраненной истории: ${report.savedHistoryMessages}")
     println("Сообщений в API-запросе: ${report.requestMessages}")
-    println("Сжато сообщений в summary: ${report.summarizedMessages}")
-    println("Summary tokens: ${report.summaryTokens}")
+    println("Сообщений вне текущего окна: ${report.summarizedMessages}")
+    println("Memory tokens: ${report.summaryTokens}")
     println("Текущий запрос: ${report.currentRequestTokens}")
     println("Полная история без сжатия: ${report.fullHistoryTokens}")
     println("История в запросе после сжатия: ${report.effectiveHistoryTokens}")

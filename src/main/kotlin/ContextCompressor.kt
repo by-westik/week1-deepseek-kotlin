@@ -1,16 +1,19 @@
 class ContextCompressor(
-    val enabled: Boolean,
+    override val enabled: Boolean,
     private val recentMessages: Int,
     private val summaryChunkSize: Int,
     private val summaryStore: SummaryStore,
     private val summarizer: ConversationSummarizer,
-) {
+) : ContextManager {
     private var storedSummary = summaryStore.load()
 
     val summaryText: String
         get() = storedSummary
 
-    fun buildPrompt(history: List<ChatMessage>, userMessage: ChatMessage): ContextPrompt {
+    override val memoryText: String
+        get() = storedSummary
+
+    override fun buildPrompt(history: List<ChatMessage>, userMessage: ChatMessage): ContextPrompt {
         if (!enabled) {
             return ContextPrompt(
                 messages = history + userMessage,
@@ -33,7 +36,7 @@ class ContextCompressor(
         )
     }
 
-    fun compact(history: List<ChatMessage>, force: Boolean = false): List<ChatMessage> {
+    override fun compact(history: List<ChatMessage>, force: Boolean): List<ChatMessage> {
         if (!enabled || history.size <= recentMessages) {
             return history
         }

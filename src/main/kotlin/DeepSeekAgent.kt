@@ -3,7 +3,7 @@ class DeepSeekAgent(
     private val settings: ModelSettings,
     private val messageStore: MessageStore,
     private val tokenCounter: TokenCounter,
-    private val contextCompressor: ContextCompressor,
+    private val contextManager: ContextManager,
 ) {
     private var messages = messageStore.load().toMutableList()
 
@@ -11,17 +11,25 @@ class DeepSeekAgent(
         get() = messages.size
 
     val summaryText: String
-        get() = contextCompressor.summaryText
+        get() = contextManager.memoryText
+
+    fun currentMessages(): List<ChatMessage> {
+        return messages.toList()
+    }
+
+    fun reloadMessages() {
+        messages = messageStore.load().toMutableList()
+    }
 
     fun compactHistoryNow(): Int {
-        messages = contextCompressor.compact(messages, force = true).toMutableList()
+        messages = contextManager.compact(messages, force = true).toMutableList()
         messageStore.save(messages)
 
         return messages.size
     }
 
     fun compactHistoryIfNeeded(): Int {
-        messages = contextCompressor.compact(messages).toMutableList()
+        messages = contextManager.compact(messages).toMutableList()
         messageStore.save(messages)
 
         return messages.size
@@ -29,7 +37,7 @@ class DeepSeekAgent(
 
     fun previewTokens(userText: String): TokenReport {
         val userMessage = ChatMessage(role = "user", content = userText)
-        val contextPrompt = contextCompressor.buildPrompt(messages, userMessage)
+        val contextPrompt = contextManager.buildPrompt(messages, userMessage)
         val currentRequestTokens = tokenCounter.countMessage(userMessage)
         val fullHistoryTokens = tokenCounter.countMessages(messages)
         val promptTokens = tokenCounter.countMessages(contextPrompt.messages)
@@ -48,15 +56,16 @@ class DeepSeekAgent(
             maxResponseTokens = settings.maxTokens,
             projectedTotalTokens = promptTokens + settings.maxTokens,
             contextLimit = contextLimit,
-            compressionEnabled = contextCompressor.enabled,
+            compressionEnabled = contextManager.enabled,
         )
     }
 
     fun ask(userText: String): ModelResponse {
+        contextManager.onUserMessage(userText)
         compactHistoryIfNeeded()
 
         val userMessage = ChatMessage(role = "user", content = userText)
-        val contextPrompt = contextCompressor.buildPrompt(messages, userMessage)
+        val contextPrompt = contextManager.buildPrompt(messages, userMessage)
         val response = client.complete(contextPrompt.messages, settings)
 
         messages += userMessage
