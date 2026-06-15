@@ -11,5 +11,8 @@ build/
 out/
 
 chat-history.json
+chat-summary.txt
 .day7-test-history.json
 .day8-live-history.json
+.day9-*.json
+.day9-*.txt

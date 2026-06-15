@@ -1,299 +1,6 @@
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import okhttp3.MediaType.Companion.toMediaType
-import org.json.JSONArray
-import org.json.JSONObject
-import java.io.IOException
-import java.nio.file.Files
 import java.nio.file.Path
 import java.util.Locale
-import java.util.concurrent.TimeUnit
 import kotlin.system.exitProcess
-
-private const val API_URL = "https://api.deepseek.com/chat/completions"
-private const val DEFAULT_MODEL = "deepseek-v4-flash"
-private const val DEFAULT_THINKING = "disabled"
-private const val DEFAULT_MAX_TOKENS = 500
-private const val DEFAULT_HISTORY_FILE = "chat-history.json"
-private const val TOKENS_PER_MILLION = 1_000_000.0
-
-private val EXIT_COMMANDS = setOf("/exit", "/quit", "exit", "quit", "выход")
-
-data class AppSettings(
-    val modelSettings: ModelSettings = ModelSettings(),
-    val historyPath: Path = Path.of(DEFAULT_HISTORY_FILE),
-    val allowOverLimit: Boolean = false,
-    val dryRunTokens: Boolean = false,
-)
-
-data class ModelSettings(
-    val model: String = DEFAULT_MODEL,
-    val thinking: String = DEFAULT_THINKING,
-    val maxTokens: Int = DEFAULT_MAX_TOKENS,
-    val stop: String? = null,
-    val temperature: Double? = null,
-)
-
-data class ModelPricing(
-    val inputCacheHitPerMillion: Double,
-    val inputCacheMissPerMillion: Double,
-    val outputPerMillion: Double,
-)
-
-data class ModelLimit(
-    val contextTokens: Int,
-)
-
-data class TokenUsage(
-    val promptTokens: Int,
-    val completionTokens: Int,
-    val totalTokens: Int,
-    val promptCacheHitTokens: Int?,
-    val promptCacheMissTokens: Int?,
-)
-
-data class ModelResponse(
-    val answer: String,
-    val usage: TokenUsage,
-    val elapsedMillis: Long,
-    val estimatedCost: Double,
-)
-
-data class DialogStats(
-    val responseCount: Int = 0,
-    val elapsedMillis: Long = 0,
-    val promptTokens: Int = 0,
-    val completionTokens: Int = 0,
-    val totalTokens: Int = 0,
-    val promptCacheHitTokens: Int = 0,
-    val promptCacheMissTokens: Int = 0,
-    val hasCacheStats: Boolean = false,
-    val estimatedCost: Double = 0.0,
-) {
-    fun plus(response: ModelResponse): DialogStats {
-        val usage = response.usage
-
-        return copy(
-            responseCount = responseCount + 1,
-            elapsedMillis = elapsedMillis + response.elapsedMillis,
-            promptTokens = promptTokens + usage.promptTokens,
-            completionTokens = completionTokens + usage.completionTokens,
-            totalTokens = totalTokens + usage.totalTokens,
-            promptCacheHitTokens = promptCacheHitTokens + (usage.promptCacheHitTokens ?: 0),
-            promptCacheMissTokens = promptCacheMissTokens + (usage.promptCacheMissTokens ?: 0),
-            hasCacheStats = hasCacheStats || usage.promptCacheHitTokens != null || usage.promptCacheMissTokens != null,
-            estimatedCost = estimatedCost + response.estimatedCost,
-        )
-    }
-}
-
-data class TokenReport(
-    val currentRequestTokens: Int,
-    val historyTokens: Int,
-    val promptTokens: Int,
-    val maxResponseTokens: Int,
-    val projectedTotalTokens: Int,
-    val contextLimit: Int,
-) {
-    val isOverLimit: Boolean
-        get() = projectedTotalTokens > contextLimit
-
-    val usagePercent: Double
-        get() = projectedTotalTokens.toDouble() / contextLimit * 100.0
-}
-
-data class ChatMessage(
-    val role: String,
-    val content: String,
-)
-
-interface TokenCounter {
-    fun countText(text: String): Int
-    fun countMessage(message: ChatMessage): Int
-    fun countMessages(messages: List<ChatMessage>): Int
-}
-
-class SimpleTokenCounter : TokenCounter {
-    private val tokenRegex = Regex("""[\p{L}_]+|\p{N}+|[^\s\p{L}\p{N}_]""")
-
-    override fun countText(text: String): Int {
-        return tokenRegex.findAll(text).count()
-    }
-
-    override fun countMessage(message: ChatMessage): Int {
-        return MESSAGE_OVERHEAD_TOKENS + countText(message.role) + countText(message.content)
-    }
-
-    override fun countMessages(messages: List<ChatMessage>): Int {
-        return messages.sumOf(::countMessage)
-    }
-
-    private companion object {
-        const val MESSAGE_OVERHEAD_TOKENS = 4
-    }
-}
-
-class DeepSeekAgent(
-    private val client: DeepSeekClient,
-    private val settings: ModelSettings,
-    private val messageStore: MessageStore,
-    private val tokenCounter: TokenCounter,
-) {
-    private val messages = messageStore.load().toMutableList()
-
-    val messageCount: Int
-        get() = messages.size
-
-    fun previewTokens(userText: String): TokenReport {
-        val userMessage = ChatMessage(role = "user", content = userText)
-        val currentRequestTokens = tokenCounter.countMessage(userMessage)
-        val historyTokens = tokenCounter.countMessages(messages)
-        val promptTokens = historyTokens + currentRequestTokens
-        val contextLimit = MODEL_LIMITS.getValue(settings.model).contextTokens
-
-        return TokenReport(
-            currentRequestTokens = currentRequestTokens,
-            historyTokens = historyTokens,
-            promptTokens = promptTokens,
-            maxResponseTokens = settings.maxTokens,
-            projectedTotalTokens = promptTokens + settings.maxTokens,
-            contextLimit = contextLimit,
-        )
-    }
-
-    fun ask(userText: String): ModelResponse {
-        val userMessage = ChatMessage(role = "user", content = userText)
-        val response = client.complete(messages + userMessage, settings)
-
-        messages += userMessage
-        messages += ChatMessage(role = "assistant", content = response.answer)
-        messageStore.save(messages)
-
-        return response
-    }
-}
-
-interface MessageStore {
-    fun load(): List<ChatMessage>
-    fun save(messages: List<ChatMessage>)
-}
-
-class JsonMessageStore(private val path: Path) : MessageStore {
-    override fun load(): List<ChatMessage> {
-        if (!Files.exists(path)) {
-            return emptyList()
-        }
-
-        val historyJson = JSONArray(Files.readString(path))
-        val messages = mutableListOf<ChatMessage>()
-
-        for (index in 0 until historyJson.length()) {
-            val messageJson = historyJson.getJSONObject(index)
-            val role = messageJson.optString("role").trim()
-            val content = messageJson.optString("content").trim()
-
-            if (role.isNotBlank() && content.isNotBlank()) {
-                messages += ChatMessage(role = role, content = content)
-            }
-        }
-
-        return messages
-    }
-
-    override fun save(messages: List<ChatMessage>) {
-        path.parent?.let { Files.createDirectories(it) }
-        Files.writeString(path, messages.toJson().toString(2))
-    }
-}
-
-class DeepSeekClient(private val apiKey: String) {
-    private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(120, TimeUnit.SECONDS)
-        .callTimeout(150, TimeUnit.SECONDS)
-        .build()
-
-    private val jsonType = "application/json; charset=utf-8".toMediaType()
-
-    fun complete(messages: List<ChatMessage>, settings: ModelSettings): ModelResponse {
-        val requestJson = JSONObject()
-            .put("model", settings.model)
-            .put("messages", messages.toJson())
-            .put("thinking", JSONObject().put("type", settings.thinking))
-            .put("max_tokens", settings.maxTokens)
-            .put("stream", false)
-
-        if (settings.stop != null) {
-            requestJson.put("stop", JSONArray().put(settings.stop))
-        }
-
-        if (settings.temperature != null) {
-            requestJson.put("temperature", settings.temperature)
-        }
-
-        val request = Request.Builder()
-            .url(API_URL)
-            .addHeader("Authorization", "Bearer $apiKey")
-            .addHeader("Content-Type", "application/json")
-            .post(requestJson.toString().toRequestBody(jsonType))
-            .build()
-
-        val startedAt = System.nanoTime()
-
-        httpClient.newCall(request).execute().use { response ->
-            val elapsedMillis = (System.nanoTime() - startedAt) / 1_000_000
-            val responseText = response.body?.string().orEmpty()
-
-            if (!response.isSuccessful) {
-                throw IOException("HTTP ${response.code}: $responseText")
-            }
-
-            val responseJson = JSONObject(responseText)
-            val answer = responseJson
-                .getJSONArray("choices")
-                .getJSONObject(0)
-                .getJSONObject("message")
-                .optString("content")
-                .trim()
-
-            if (answer.isBlank()) {
-                throw IOException("модель вернула пустой ответ")
-            }
-
-            val usage = parseUsage(responseJson)
-            val estimatedCost = calculateCost(settings.model, usage)
-
-            return ModelResponse(
-                answer = answer,
-                usage = usage,
-                elapsedMillis = elapsedMillis,
-                estimatedCost = estimatedCost,
-            )
-        }
-    }
-}
-
-private val SUPPORTED_MODELS = setOf("deepseek-v4-flash", "deepseek-v4-pro")
-
-private val MODEL_LIMITS = mapOf(
-    "deepseek-v4-flash" to ModelLimit(contextTokens = 1_048_576),
-    "deepseek-v4-pro" to ModelLimit(contextTokens = 1_048_576),
-)
-
-private val MODEL_PRICING = mapOf(
-    "deepseek-v4-flash" to ModelPricing(
-        inputCacheHitPerMillion = 0.0028,
-        inputCacheMissPerMillion = 0.14,
-        outputPerMillion = 0.28,
-    ),
-    "deepseek-v4-pro" to ModelPricing(
-        inputCacheHitPerMillion = 0.003625,
-        inputCacheMissPerMillion = 0.435,
-        outputPerMillion = 0.87,
-    ),
-)
 
 fun main(args: Array<String>) {
     val apiKey = System.getenv("DEEPSEEK_API_KEY")
@@ -310,12 +17,26 @@ fun main(args: Array<String>) {
         exitProcess(1)
     }
     val settings = appSettings.modelSettings
+    val tokenCounter = SimpleTokenCounter()
+    val client = DeepSeekClient(apiKey)
+    val summarizer = if (appSettings.dryRunTokens) {
+        NoOpConversationSummarizer()
+    } else {
+        DeepSeekConversationSummarizer(client = client, settings = settings)
+    }
 
     val agent = DeepSeekAgent(
-        client = DeepSeekClient(apiKey),
+        client = client,
         settings = settings,
         messageStore = JsonMessageStore(appSettings.historyPath),
-        tokenCounter = SimpleTokenCounter(),
+        tokenCounter = tokenCounter,
+        contextCompressor = ContextCompressor(
+            enabled = appSettings.compressionEnabled,
+            recentMessages = appSettings.recentMessages,
+            summaryChunkSize = appSettings.summaryChunkSize,
+            summaryStore = TextSummaryStore(appSettings.summaryPath),
+            summarizer = summarizer,
+        ),
     )
     var dialogStats = DialogStats()
 
@@ -323,9 +44,37 @@ fun main(args: Array<String>) {
     println("Введите сообщение. Для выхода: /exit, /quit или пустой EOF.")
     println("История: ${appSettings.historyPath.toAbsolutePath()}")
     println("Загружено сообщений из истории: ${agent.messageCount}")
+    if (appSettings.compressionEnabled) {
+        println("Компрессия контекста: включена")
+        println("Последние сообщения без сжатия: ${appSettings.recentMessages}")
+        println("Summary: ${appSettings.summaryPath.toAbsolutePath()}")
+        println("Размер summary: ${tokenCounter.countText(agent.summaryText)} токенов")
+    } else {
+        println("Компрессия контекста: выключена")
+    }
     println()
 
-    while (true) {
+        if (appSettings.compactNow) {
+            val remainingMessages = agent.compactHistoryNow()
+            println("История сжата. Сообщений осталось в JSON: $remainingMessages")
+            println("Summary обновлен: ${appSettings.summaryPath.toAbsolutePath()}")
+            return
+        }
+
+        val messagesBeforeStartupCompact = agent.messageCount
+        val remainingMessages = try {
+            agent.compactHistoryIfNeeded()
+        } catch (error: Exception) {
+            System.err.println("Ошибка сжатия истории: ${error.message}")
+            null
+        }
+
+        if (remainingMessages != null && remainingMessages != messagesBeforeStartupCompact) {
+            println("История сжата при старте. Сообщений осталось в JSON: $remainingMessages")
+            println("Summary обновлен: ${appSettings.summaryPath.toAbsolutePath()}")
+        }
+
+        while (true) {
         print("Вы: ")
         val input = readLine() ?: break
         val userText = input.trim()
@@ -380,8 +129,13 @@ private fun parseArgs(args: Array<String>): AppSettings {
     var stop: String? = null
     var temperature: Double? = null
     var historyPath = Path.of(DEFAULT_HISTORY_FILE)
+    var summaryPath = Path.of(DEFAULT_SUMMARY_FILE)
     var allowOverLimit = false
     var dryRunTokens = false
+    var compressionEnabled = false
+    var recentMessages = DEFAULT_RECENT_MESSAGES
+    var summaryChunkSize = DEFAULT_SUMMARY_CHUNK_SIZE
+    var compactNow = false
     var index = 0
 
     while (index < args.size) {
@@ -470,6 +224,53 @@ private fun parseArgs(args: Array<String>): AppSettings {
                 index++
             }
 
+            arg == "--compress-context" -> {
+                compressionEnabled = true
+                index++
+            }
+
+            arg == "--recent-messages" -> {
+                val value = args.getOrNull(index + 1)
+                    ?: throw IllegalArgumentException("после --recent-messages нужно указать число")
+                recentMessages = parsePositiveInt(value, "--recent-messages")
+                index += 2
+            }
+
+            arg.startsWith("--recent-messages=") -> {
+                recentMessages = parsePositiveInt(arg.substringAfter("="), "--recent-messages")
+                index++
+            }
+
+            arg == "--summary-file" -> {
+                val value = args.getOrNull(index + 1)
+                    ?: throw IllegalArgumentException("после --summary-file нужно указать путь к txt-файлу")
+                summaryPath = parseSummaryPath(value)
+                index += 2
+            }
+
+            arg.startsWith("--summary-file=") -> {
+                summaryPath = parseSummaryPath(arg.substringAfter("="))
+                index++
+            }
+
+            arg == "--summary-chunk-size" -> {
+                val value = args.getOrNull(index + 1)
+                    ?: throw IllegalArgumentException("после --summary-chunk-size нужно указать число")
+                summaryChunkSize = parsePositiveInt(value, "--summary-chunk-size")
+                index += 2
+            }
+
+            arg.startsWith("--summary-chunk-size=") -> {
+                summaryChunkSize = parsePositiveInt(arg.substringAfter("="), "--summary-chunk-size")
+                index++
+            }
+
+            arg == "--compact-now" -> {
+                compactNow = true
+                compressionEnabled = true
+                index++
+            }
+
             else -> throw IllegalArgumentException("неизвестный аргумент: $arg")
         }
     }
@@ -483,8 +284,13 @@ private fun parseArgs(args: Array<String>): AppSettings {
             temperature = temperature,
         ),
         historyPath = historyPath,
+        summaryPath = summaryPath,
         allowOverLimit = allowOverLimit,
         dryRunTokens = dryRunTokens,
+        compressionEnabled = compressionEnabled,
+        recentMessages = recentMessages,
+        summaryChunkSize = summaryChunkSize,
+        compactNow = compactNow,
     )
 }
 
@@ -538,60 +344,25 @@ private fun parseHistoryPath(value: String): Path {
     return Path.of(path)
 }
 
-private fun List<ChatMessage>.toJson(): JSONArray {
-    val messagesJson = JSONArray()
+private fun parseSummaryPath(value: String): Path {
+    val path = value.trim()
 
-    forEach { message ->
-        messagesJson.put(
-            JSONObject()
-                .put("role", message.role)
-                .put("content", message.content),
-        )
+    if (path.isBlank()) {
+        throw IllegalArgumentException("--summary-file не должен быть пустым")
     }
 
-    return messagesJson
+    return Path.of(path)
 }
 
-private fun parseUsage(responseJson: JSONObject): TokenUsage {
-    val usageJson = responseJson.optJSONObject("usage")
-        ?: return TokenUsage(
-            promptTokens = 0,
-            completionTokens = 0,
-            totalTokens = 0,
-            promptCacheHitTokens = null,
-            promptCacheMissTokens = null,
-        )
+private fun parsePositiveInt(value: String, optionName: String): Int {
+    val number = value.toIntOrNull()
+        ?: throw IllegalArgumentException("$optionName должен быть числом")
 
-    return TokenUsage(
-        promptTokens = usageJson.optInt("prompt_tokens", 0),
-        completionTokens = usageJson.optInt("completion_tokens", 0),
-        totalTokens = usageJson.optInt("total_tokens", 0),
-        promptCacheHitTokens = usageJson.optionalInt("prompt_cache_hit_tokens"),
-        promptCacheMissTokens = usageJson.optionalInt("prompt_cache_miss_tokens"),
-    )
-}
-
-private fun JSONObject.optionalInt(name: String): Int? {
-    return if (has(name) && !isNull(name)) {
-        optInt(name)
-    } else {
-        null
-    }
-}
-
-private fun calculateCost(model: String, usage: TokenUsage): Double {
-    val pricing = MODEL_PRICING[model] ?: return 0.0
-
-    val inputCost = if (usage.promptCacheHitTokens != null || usage.promptCacheMissTokens != null) {
-        ((usage.promptCacheHitTokens ?: 0) / TOKENS_PER_MILLION * pricing.inputCacheHitPerMillion) +
-            ((usage.promptCacheMissTokens ?: 0) / TOKENS_PER_MILLION * pricing.inputCacheMissPerMillion)
-    } else {
-        usage.promptTokens / TOKENS_PER_MILLION * pricing.inputCacheMissPerMillion
+    if (number <= 0) {
+        throw IllegalArgumentException("$optionName должен быть больше 0")
     }
 
-    val outputCost = usage.completionTokens / TOKENS_PER_MILLION * pricing.outputPerMillion
-
-    return inputCost + outputCost
+    return number
 }
 
 private fun printDialogStats(settings: ModelSettings, stats: DialogStats) {
@@ -615,8 +386,14 @@ private fun printDialogStats(settings: ModelSettings, stats: DialogStats) {
 private fun printTokenReport(report: TokenReport) {
     println()
     println("=== Токены перед запросом ===")
+    println("Компрессия: ${if (report.compressionEnabled) "включена" else "выключена"}")
+    println("Сообщений в сохраненной истории: ${report.savedHistoryMessages}")
+    println("Сообщений в API-запросе: ${report.requestMessages}")
+    println("Сжато сообщений в summary: ${report.summarizedMessages}")
+    println("Summary tokens: ${report.summaryTokens}")
     println("Текущий запрос: ${report.currentRequestTokens}")
-    println("История диалога: ${report.historyTokens}")
+    println("Полная история без сжатия: ${report.fullHistoryTokens}")
+    println("История в запросе после сжатия: ${report.effectiveHistoryTokens}")
     println("Prompt всего: ${report.promptTokens}")
     println("Max response tokens: ${report.maxResponseTokens}")
     println("Prompt + максимум ответа: ${report.projectedTotalTokens}")
