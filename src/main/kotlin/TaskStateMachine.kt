@@ -124,7 +124,10 @@ data class TaskContext(
 data class TaskTransition(
     val context: TaskContext,
     val message: String,
-)
+) {
+    val autoExecutionPrompt: String?
+        get() = context.toAutoExecutionPrompt()
+}
 
 /** Finite state machine for assistant task handling. */
 object TaskStateMachine {
@@ -146,7 +149,9 @@ object TaskStateMachine {
                 "plan_step_1" to plan[0],
                 "plan_step_2" to plan[1],
                 "plan_step_3" to plan[2],
-                "execution_steps_total" to "1",
+                "execution_step_1" to plan[0],
+                "execution_step_2" to plan[1],
+                "execution_steps_total" to "2",
             ),
         )
 
@@ -230,17 +235,16 @@ object TaskStateMachine {
     }
 
     fun status(context: TaskContext): String {
-        return """
-            Текущая задача:
-            ${context.toDisplayText()}
-        """.trimIndent()
+        return "Текущая задача:\n${context.toDisplayText()}"
     }
 
     private fun moveToExecution(context: TaskContext): TaskTransition {
         val nextContext = context.copy(
             state = TaskState.Execution,
             currentStepNumber = 1,
-            currentStepDescription = context.recoveryData["plan_step_1"] ?: "Выполнить первый шаг задачи",
+            currentStepDescription = context.recoveryData["execution_step_1"]
+                ?: context.recoveryData["plan_step_1"]
+                ?: "Выполнить первый шаг задачи",
             expectedAction = expectedActionFor(TaskState.Execution),
             updatedAt = Instant.now().toString(),
         )
@@ -252,7 +256,7 @@ object TaskStateMachine {
     }
 
     private fun moveWithinOrAfterExecution(context: TaskContext): TaskTransition {
-        val totalSteps = context.recoveryData["execution_steps_total"]?.toIntOrNull() ?: 1
+        val totalSteps = inferredExecutionStepsTotal(context)
 
         if (context.currentStepNumber < totalSteps) {
             val nextStep = context.currentStepNumber + 1
@@ -303,7 +307,7 @@ object TaskStateMachine {
     private fun expectedActionFor(state: TaskState): String {
         return when (state) {
             TaskState.Planning -> "Проверьте план и вызовите /task next."
-            TaskState.Execution -> "Ассистент выполняет текущий шаг. Вызовите /task next для перехода к проверке."
+            TaskState.Execution -> "Ассистент выполняет текущий шаг. Вызовите /task next для перехода к следующему шагу или проверке."
             TaskState.Validation -> "Проверьте результат. Вызовите /task next или /task done для завершения."
             TaskState.Done -> "Действий не требуется."
         }
@@ -325,6 +329,48 @@ object TaskStateMachine {
                 "Проверить результат и зафиксировать следующий шаг.",
             )
         }
+    }
+}
+
+private fun inferredExecutionStepsTotal(context: TaskContext): Int {
+    val configuredTotal = context.recoveryData["execution_steps_total"]?.toIntOrNull() ?: 0
+    val explicitExecutionSteps = context.recoveryData.keys
+        .mapNotNull { key -> Regex("""execution_step_(\d+)""").matchEntire(key)?.groupValues?.get(1)?.toIntOrNull() }
+        .maxOrNull() ?: 0
+    val planBasedExecutionSteps = if (context.recoveryData.containsKey("plan_step_2")) {
+        2
+    } else {
+        1
+    }
+
+    return maxOf(configuredTotal, explicitExecutionSteps, planBasedExecutionSteps, 1)
+}
+
+private fun TaskContext.toAutoExecutionPrompt(): String? {
+    if (paused || isDone) {
+        return null
+    }
+
+    return when (state) {
+        TaskState.Planning -> null
+        TaskState.Execution -> """
+            Выполни текущий шаг задачи.
+            Задача: $description
+            Stage: ${state.name}
+            Шаг $currentStepNumber: $currentStepDescription
+            Ожидаемое действие: $expectedAction
+            Используй recoveryData как вводные и ограничения. Не пересказывай весь план заново.
+            Если данных достаточно, дай конкретный результат текущего шага. Если данных не хватает, задай только самые нужные уточняющие вопросы.
+        """.trimIndent()
+        TaskState.Validation -> """
+            Проверь результат текущей задачи.
+            Задача: $description
+            Stage: ${state.name}
+            Шаг $currentStepNumber: $currentStepDescription
+            Ожидаемое действие: $expectedAction
+            Используй историю диалога и recoveryData. Дай краткую проверку, что готово, что требует исправления, и можно ли завершать задачу.
+        """.trimIndent()
+        TaskState.Done -> null
     }
 }
 

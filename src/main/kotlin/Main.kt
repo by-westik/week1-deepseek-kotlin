@@ -4,6 +4,11 @@ import kotlin.system.exitProcess
 
 private val PROFILE_FIELDS = setOf("tone", "gender", "length", "language", "lang", "notes", "note")
 
+private data class TaskCommandResult(
+    val handled: Boolean,
+    val dialogStats: DialogStats,
+)
+
 fun main(args: Array<String>) {
     val parsedSettings = try {
         parseArgs(args)
@@ -23,9 +28,10 @@ fun main(args: Array<String>) {
     )
     memory.loadUserProfileIntoWorking()
     val memoryFormatter = MemoryStatusFormatter()
+    val invariantRegistry = InvariantRegistry.default()
 
     if (appSettings.memoryStatus) {
-        println(memoryFormatter.format(memory))
+        println(memoryFormatter.format(memory, invariantRegistry))
         println()
         println("User workspace: ${longTermStore.userDir(memoryUser).toAbsolutePath()}")
         println("History file: ${appSettings.historyPath.toAbsolutePath()}")
@@ -147,11 +153,19 @@ fun main(args: Array<String>) {
         }
 
         try {
-            if (handleTaskCommand(userText, memory)) {
+            val taskCommandResult = handleTaskCommand(
+                input = userText,
+                memory = memory,
+                agent = agent,
+                appSettings = appSettings,
+                dialogStats = dialogStats,
+            )
+            if (taskCommandResult.handled) {
+                dialogStats = taskCommandResult.dialogStats
                 continue
             }
 
-            if (handleMemoryCommand(userText, memory, memoryFormatter)) {
+            if (handleMemoryCommand(userText, memory, memoryFormatter, invariantRegistry)) {
                 continue
             }
         } catch (error: IllegalArgumentException) {
@@ -160,37 +174,22 @@ fun main(args: Array<String>) {
             continue
         }
 
-        ensureUserProfileForRequest(memory)
-        captureImplicitMemory(userText, memory)
-
-        try {
-            val tokenReport = agent.previewTokens(userText)
-            printTokenReport(tokenReport)
-
-            if (tokenReport.isOverLimit && !appSettings.allowOverLimit) {
-                println("Запрос не отправлен: прогноз превышает лимит модели.")
-                println("Добавьте --allow-over-limit, если хотите отправить запрос и увидеть ошибку API на практике.")
-                println()
-                continue
-            }
-
-            if (appSettings.dryRunTokens) {
-                println("Dry run: запрос не отправлен в API.")
-                println()
-                continue
-            }
-
-            val response = agent.ask(userText)
-            dialogStats = dialogStats.plus(response)
+        val invariantViolation = invariantRegistry.check(userText, memory.working.currentTask())
+        if (invariantViolation != null) {
+            println(formatInvariantViolation(invariantViolation))
             println()
-            println("Агент: ${response.answer}")
-            println()
-            printResponseTokenStats(response, dialogStats)
-            println()
-        } catch (error: Exception) {
-            System.err.println("Ошибка: ${error.message}")
-            println()
+            continue
         }
+
+        ensureUserProfileForRequest(memory)
+        captureActiveTaskInput(userText, memory)
+        captureImplicitMemory(userText, memory)
+        dialogStats = sendAgentRequest(
+            userText = userText,
+            agent = agent,
+            appSettings = appSettings,
+            dialogStats = dialogStats,
+        )
     }
 
     println()
@@ -211,6 +210,53 @@ private fun askWhetherTaskIsSolved(memory: AssistantMemory) {
     } else {
         println("WorkingMemory сохранена для следующей сессии.")
     }
+}
+
+private fun sendAgentRequest(
+    userText: String,
+    agent: DeepSeekAgent,
+    appSettings: AppSettings,
+    dialogStats: DialogStats,
+): DialogStats {
+    return try {
+        val tokenReport = agent.previewTokens(userText)
+        printTokenReport(tokenReport)
+
+        if (tokenReport.isOverLimit && !appSettings.allowOverLimit) {
+            println("Запрос не отправлен: прогноз превышает лимит модели.")
+            println("Добавьте --allow-over-limit, если хотите отправить запрос и увидеть ошибку API на практике.")
+            println()
+            return dialogStats
+        }
+
+        if (appSettings.dryRunTokens) {
+            println("Dry run: запрос не отправлен в API.")
+            println()
+            return dialogStats
+        }
+
+        val response = agent.ask(userText)
+        val updatedStats = dialogStats.plus(response)
+        println()
+        println("Агент: ${response.answer}")
+        println()
+        printResponseTokenStats(response, updatedStats)
+        println()
+
+        updatedStats
+    } catch (error: Exception) {
+        System.err.println("Ошибка: ${error.message}")
+        println()
+        dialogStats
+    }
+}
+
+private fun formatInvariantViolation(violation: InvariantViolation): String {
+    return """
+        Запрос отклонен.
+        Нарушенный инвариант: ${violation.invariant.id}
+        ${violation.explanation}
+    """.trimIndent()
 }
 
 private fun ensureUserProfileForRequest(memory: AssistantMemory): UserProfile {
@@ -365,6 +411,7 @@ private fun handleMemoryCommand(
     input: String,
     memory: AssistantMemory,
     formatter: MemoryStatusFormatter,
+    invariantRegistry: InvariantRegistry,
 ): Boolean {
     val trimmed = input.trim()
     val parts = trimmed.split(Regex("\\s+"), limit = 3).filter { it.isNotBlank() }
@@ -382,7 +429,7 @@ private fun handleMemoryCommand(
 
     return when {
         parts[0] == "/memory-status" || parts[0] == "memory-status" -> {
-            println(formatter.format(memory))
+            println(formatter.format(memory, invariantRegistry))
             println()
             true
         }
@@ -441,12 +488,15 @@ private fun handleMemoryCommand(
 private fun handleTaskCommand(
     input: String,
     memory: AssistantMemory,
-): Boolean {
+    agent: DeepSeekAgent,
+    appSettings: AppSettings,
+    dialogStats: DialogStats,
+): TaskCommandResult {
     val trimmed = input.trim()
     val parts = trimmed.split(Regex("\\s+"), limit = 3).filter { it.isNotBlank() }
 
     if (parts.firstOrNull() != "/task") {
-        return false
+        return TaskCommandResult(handled = false, dialogStats = dialogStats)
     }
 
     fun recordCommandResult(answer: String) {
@@ -459,6 +509,7 @@ private fun handleTaskCommand(
     val command = parts.getOrNull(1)?.lowercase()
         ?: throw IllegalArgumentException("/task ожидает команду start, next, pause, resume, status или done")
 
+    var updatedDialogStats = dialogStats
     val answer = when (command) {
         "start" -> {
             val description = parts.getOrNull(2)
@@ -477,6 +528,17 @@ private fun handleTaskCommand(
         "next" -> {
             val transition = TaskStateMachine.next(memory.working.currentTaskOrError())
             memory.working.putCurrentTask(transition.context)
+            transition.autoExecutionPrompt?.let { prompt ->
+                ensureUserProfileForRequest(memory)
+                recordCommandResult(transition.message)
+                updatedDialogStats = sendAgentRequest(
+                    userText = prompt,
+                    agent = agent,
+                    appSettings = appSettings,
+                    dialogStats = updatedDialogStats,
+                )
+                return TaskCommandResult(handled = true, dialogStats = updatedDialogStats)
+            }
             transition.message
         }
 
@@ -504,7 +566,7 @@ private fun handleTaskCommand(
     }
 
     recordCommandResult(answer)
-    return true
+    return TaskCommandResult(handled = true, dialogStats = updatedDialogStats)
 }
 
 private fun WorkingMemory.currentTaskOrError(): TaskContext {
@@ -592,6 +654,34 @@ private fun captureImplicitMemory(input: String, memory: AssistantMemory) {
             }
         }
     }
+}
+
+private fun captureActiveTaskInput(input: String, memory: AssistantMemory) {
+    val task = memory.working.currentTask()
+
+    if (task == null || task.paused || task.isDone) {
+        return
+    }
+
+    val normalized = input.lowercase().replace('ё', 'е')
+    val inputIndex = task.recoveryData.keys.count { it.startsWith("user_input_") } + 1
+    val extraData = linkedMapOf("user_input_$inputIndex" to input)
+
+    if ("огранич" in normalized) {
+        val constraintIndex = task.recoveryData.keys.count { it.startsWith("constraint_") } + 1
+        extraData["constraint_$constraintIndex"] = input
+    }
+    if ("цель" in normalized || "цел" in normalized || "цул" in normalized) {
+        val goalIndex = task.recoveryData.keys.count { it.startsWith("goal_input_") } + 1
+        extraData["goal_input_$goalIndex"] = input
+    }
+
+    memory.working.putCurrentTask(
+        task.copy(
+            recoveryData = task.recoveryData + extraData,
+            updatedAt = java.time.Instant.now().toString(),
+        ),
+    )
 }
 
 private fun splitKeyValue(input: String, commandName: String): Pair<String, String> {

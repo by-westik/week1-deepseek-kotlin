@@ -584,11 +584,17 @@ data class AssistantMemory(
 
 /** Builds a human-readable dump of all memory layers for the CLI. */
 class MemoryStatusFormatter {
-    fun format(memory: AssistantMemory): String {
+    fun format(
+        memory: AssistantMemory,
+        invariantRegistry: InvariantRegistry? = null,
+    ): String {
         val longTerm = memory.longTerm.snapshot()
 
         return buildString {
             appendLine("=== Memory Status ===")
+            appendLine()
+            appendLine("Active Invariants")
+            appendInvariants(invariantRegistry?.activeInvariants().orEmpty())
             appendLine()
             appendLine("ShortTermMemory (текущая сессия, in-memory)")
             appendMessages(memory.shortTerm.all())
@@ -616,6 +622,18 @@ class MemoryStatusFormatter {
             appendMap("decisions", longTerm.decisions)
             appendMap("knowledge", longTerm.knowledge)
         }.trimEnd()
+    }
+
+    private fun StringBuilder.appendInvariants(invariants: List<Invariant>) {
+        if (invariants.isEmpty()) {
+            appendLine("  (не настроены)")
+            return
+        }
+
+        invariants.forEach { invariant ->
+            appendLine("  ${invariant.id}: active")
+            appendLine("    ${invariant.description}")
+        }
     }
 
     private fun StringBuilder.appendMessages(messages: List<ChatMessage>) {
