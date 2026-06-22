@@ -41,6 +41,7 @@ class DeepSeekAgent(
         val contextPrompt = contextManager
             .buildPrompt(messages, userMessage)
             .withUserProfile(memory.loadUserProfileIntoWorking())
+            .withTaskContext(memory.working.currentTask())
         val currentRequestTokens = tokenCounter.countMessage(userMessage)
         val fullHistoryTokens = tokenCounter.countMessages(messages)
         val promptTokens = tokenCounter.countMessages(contextPrompt.messages)
@@ -72,6 +73,7 @@ class DeepSeekAgent(
         val contextPrompt = contextManager
             .buildPrompt(messages, userMessage)
             .withUserProfile(memory.loadUserProfileIntoWorking())
+            .withTaskContext(memory.working.currentTask())
         val response = client.complete(contextPrompt.messages, settings)
         val assistantMessage = ChatMessage(role = "assistant", content = response.answer)
 
@@ -94,6 +96,21 @@ class DeepSeekAgent(
                 ChatMessage(
                     role = "system",
                     content = profile.toSystemInstruction(),
+                ),
+            ) + messages,
+        )
+    }
+
+    private fun ContextPrompt.withTaskContext(task: TaskContext?): ContextPrompt {
+        if (task == null || task.paused || task.isDone) {
+            return this
+        }
+
+        return copy(
+            messages = listOf(
+                ChatMessage(
+                    role = "system",
+                    content = task.toSystemInstruction(),
                 ),
             ) + messages,
         )

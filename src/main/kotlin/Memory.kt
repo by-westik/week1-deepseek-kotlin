@@ -272,9 +272,35 @@ class WorkingMemory(
         return snapshot.userProfileSource
     }
 
+    /** Stores the current formal task state machine context. */
+    fun putCurrentTask(task: TaskContext) {
+        snapshot = snapshot.copy(
+            currentTask = task,
+            updatedAt = Instant.now().toString(),
+        )
+        persist()
+    }
+
+    /** Returns the current formal task state machine context, if any. */
+    fun currentTask(): TaskContext? {
+        return snapshot.currentTask
+    }
+
+    /** Removes only the formal task state machine context. */
+    fun clearCurrentTask() {
+        snapshot = snapshot.copy(
+            currentTask = null,
+            updatedAt = Instant.now().toString(),
+        )
+        persist()
+    }
+
     /** Returns true when the current task has no stored context, results, or flags. */
     fun isEmpty(): Boolean {
-        return snapshot.context.isEmpty() && snapshot.intermediateResults.isEmpty() && snapshot.flags.isEmpty()
+        return snapshot.context.isEmpty() &&
+            snapshot.intermediateResults.isEmpty() &&
+            snapshot.flags.isEmpty() &&
+            snapshot.currentTask == null
     }
 
     /** Clears the current task scratchpad after the task is explicitly closed. */
@@ -304,6 +330,7 @@ data class WorkingMemorySnapshot(
     val flags: Map<String, Boolean> = emptyMap(),
     val loadedUserProfile: UserProfile? = null,
     val userProfileSource: String? = null,
+    val currentTask: TaskContext? = null,
     val createdAt: String = Instant.now().toString(),
     val updatedAt: String = createdAt,
 )
@@ -332,6 +359,8 @@ class WorkingMemoryStore(private val memoryDir: Path) {
             flags = json.optJSONObject("flags").toBooleanMap(),
             loadedUserProfile = json.optJSONObject("loadedUserProfile")?.let { UserProfile.fromJsonObject(it) },
             userProfileSource = json.optString("userProfileSource").ifBlank { null },
+            currentTask = (json.optJSONObject("current_task") ?: json.optJSONObject("currentTask"))
+                ?.let { TaskContext.fromJsonObject(it) },
             createdAt = json.optString("createdAt", Instant.now().toString()),
             updatedAt = json.optString("updatedAt", Instant.now().toString()),
         )
@@ -573,6 +602,7 @@ class MemoryStatusFormatter {
                 profile = memory.working.userProfile(),
                 source = memory.working.userProfileSource(),
             )
+            appendCurrentTask(memory.working.currentTask())
             appendLine()
             appendLine("LongTermMemory (пользователь: ${longTerm.userId}, JSON)")
             appendLine("createdAt: ${longTerm.createdAt}")
@@ -629,6 +659,19 @@ class MemoryStatusFormatter {
             appendLine("    $line")
         }
     }
+
+    private fun StringBuilder.appendCurrentTask(task: TaskContext?) {
+        appendLine("  current_task:")
+
+        if (task == null) {
+            appendLine("    (пусто)")
+            return
+        }
+
+        task.toDisplayText().lines().forEach { line ->
+            appendLine("    $line")
+        }
+    }
 }
 
 private fun LongTermMemorySnapshot.toJson(): JSONObject {
@@ -655,6 +698,9 @@ private fun WorkingMemorySnapshot.toJson(): JSONObject {
     }
     userProfileSource?.let { source ->
         json.put("userProfileSource", source)
+    }
+    currentTask?.let { task ->
+        json.put("current_task", task.toJsonObject())
     }
 
     return json

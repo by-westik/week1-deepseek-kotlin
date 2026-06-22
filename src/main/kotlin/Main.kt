@@ -147,6 +147,10 @@ fun main(args: Array<String>) {
         }
 
         try {
+            if (handleTaskCommand(userText, memory)) {
+                continue
+            }
+
             if (handleMemoryCommand(userText, memory, memoryFormatter)) {
                 continue
             }
@@ -432,6 +436,80 @@ private fun handleMemoryCommand(
 
         else -> false
     }
+}
+
+private fun handleTaskCommand(
+    input: String,
+    memory: AssistantMemory,
+): Boolean {
+    val trimmed = input.trim()
+    val parts = trimmed.split(Regex("\\s+"), limit = 3).filter { it.isNotBlank() }
+
+    if (parts.firstOrNull() != "/task") {
+        return false
+    }
+
+    fun recordCommandResult(answer: String) {
+        memory.shortTerm.add(ChatMessage(role = "user", content = trimmed))
+        memory.shortTerm.add(ChatMessage(role = "assistant", content = answer))
+        println(answer)
+        println()
+    }
+
+    val command = parts.getOrNull(1)?.lowercase()
+        ?: throw IllegalArgumentException("/task ожидает команду start, next, pause, resume, status или done")
+
+    val answer = when (command) {
+        "start" -> {
+            val description = parts.getOrNull(2)
+                ?: throw IllegalArgumentException("/task start требует описание задачи")
+            val existingTask = memory.working.currentTask()
+
+            if (existingTask != null && !existingTask.isDone) {
+                throw IllegalArgumentException("уже есть активная задача. Используйте /task done или /work clear перед стартом новой")
+            }
+
+            val transition = TaskStateMachine.start(description)
+            memory.working.putCurrentTask(transition.context)
+            transition.message
+        }
+
+        "next" -> {
+            val transition = TaskStateMachine.next(memory.working.currentTaskOrError())
+            memory.working.putCurrentTask(transition.context)
+            transition.message
+        }
+
+        "pause" -> {
+            val transition = TaskStateMachine.pause(memory.working.currentTaskOrError())
+            memory.working.putCurrentTask(transition.context)
+            transition.message
+        }
+
+        "resume" -> {
+            val transition = TaskStateMachine.resume(memory.working.currentTaskOrError())
+            memory.working.putCurrentTask(transition.context)
+            transition.message
+        }
+
+        "status" -> TaskStateMachine.status(memory.working.currentTaskOrError())
+
+        "done" -> {
+            val transition = TaskStateMachine.done(memory.working.currentTaskOrError())
+            memory.working.putCurrentTask(transition.context)
+            transition.message
+        }
+
+        else -> throw IllegalArgumentException("/task ожидает команду start, next, pause, resume, status или done")
+    }
+
+    recordCommandResult(answer)
+    return true
+}
+
+private fun WorkingMemory.currentTaskOrError(): TaskContext {
+    return currentTask()
+        ?: throw IllegalArgumentException("активная задача не найдена. Начните с /task start <описание>")
 }
 
 private fun handleProfileCommand(
