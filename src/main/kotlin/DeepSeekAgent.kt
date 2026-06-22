@@ -4,6 +4,7 @@ class DeepSeekAgent(
     private val messageStore: MessageStore,
     private val tokenCounter: TokenCounter,
     private val contextManager: ContextManager,
+    private val memory: AssistantMemory,
 ) {
     private var messages = messageStore.load().toMutableList()
 
@@ -65,11 +66,14 @@ class DeepSeekAgent(
         compactHistoryIfNeeded()
 
         val userMessage = ChatMessage(role = "user", content = userText)
+        memory.shortTerm.add(userMessage)
         val contextPrompt = contextManager.buildPrompt(messages, userMessage)
         val response = client.complete(contextPrompt.messages, settings)
+        val assistantMessage = ChatMessage(role = "assistant", content = response.answer)
 
         messages += userMessage
-        messages += ChatMessage(role = "assistant", content = response.answer)
+        messages += assistantMessage
+        memory.shortTerm.add(assistantMessage)
         compactHistoryIfNeeded()
         messageStore.save(messages)
 

@@ -3,6 +3,30 @@ import java.util.Locale
 import kotlin.system.exitProcess
 
 fun main(args: Array<String>) {
+    val appSettings = try {
+        parseArgs(args)
+    } catch (error: IllegalArgumentException) {
+        System.err.println("Ошибка: ${error.message}")
+        exitProcess(1)
+    }
+    val longTermStore = LongTermMemoryStore(appSettings.memoryDir)
+    val workingStore = WorkingMemoryStore(appSettings.memoryDir)
+    val memoryUser = longTermStore.sanitizeUserId(appSettings.memoryUser)
+    val memory = AssistantMemory(
+        shortTerm = ShortTermMemory(),
+        working = WorkingMemory(userId = memoryUser, store = workingStore),
+        longTerm = LongTermMemory(userId = memoryUser, store = longTermStore),
+    )
+    val memoryFormatter = MemoryStatusFormatter()
+
+    if (appSettings.memoryStatus) {
+        println(memoryFormatter.format(memory))
+        println()
+        println("Working memory file: ${workingStore.userPath(memoryUser).toAbsolutePath()}")
+        println("Long-term memory file: ${longTermStore.userPath(memoryUser).toAbsolutePath()}")
+        return
+    }
+
     val apiKey = System.getenv("DEEPSEEK_API_KEY")
 
     if (apiKey.isNullOrBlank()) {
@@ -10,12 +34,6 @@ fun main(args: Array<String>) {
         exitProcess(1)
     }
 
-    val appSettings = try {
-        parseArgs(args)
-    } catch (error: IllegalArgumentException) {
-        System.err.println("Ошибка: ${error.message}")
-        exitProcess(1)
-    }
     val settings = appSettings.modelSettings
     val tokenCounter = SimpleTokenCounter()
     val client = DeepSeekClient(apiKey)
@@ -45,12 +63,16 @@ fun main(args: Array<String>) {
         messageStore = messageStore,
         tokenCounter = tokenCounter,
         contextManager = contextManager,
+        memory = memory,
     )
     var dialogStats = DialogStats()
 
     println("DeepSeek Agent")
     println("Введите сообщение. Для выхода: /exit, /quit или пустой EOF.")
     println("История: ${appSettings.historyPath.toAbsolutePath()}")
+    println("Пользователь памяти: $memoryUser")
+    println("Рабочая память: ${workingStore.userPath(memoryUser).toAbsolutePath()}")
+    println("Долговременная память: ${longTermStore.userPath(memoryUser).toAbsolutePath()}")
     println("Загружено сообщений из истории: ${agent.messageCount}")
     println("Стратегия контекста: ${appSettings.contextStrategy.name.lowercase()}")
     if (branchStore != null) {
@@ -70,31 +92,31 @@ fun main(args: Array<String>) {
     }
     println()
 
-        if (appSettings.compactNow) {
-            val remainingMessages = agent.compactHistoryNow()
-            println("История сжата. Сообщений осталось в JSON: $remainingMessages")
-            if (appSettings.contextStrategy == ContextStrategyType.SUMMARY) {
-                println("Summary обновлен: ${appSettings.summaryPath.toAbsolutePath()}")
-            }
-            return
-        }
-
+    if (appSettings.compactNow) {
+        val remainingMessages = agent.compactHistoryNow()
+        println("История сжата. Сообщений осталось в JSON: $remainingMessages")
         if (appSettings.contextStrategy == ContextStrategyType.SUMMARY) {
-            val messagesBeforeStartupCompact = agent.messageCount
-            val remainingMessages = try {
-                agent.compactHistoryIfNeeded()
-            } catch (error: Exception) {
-                System.err.println("Ошибка сжатия истории: ${error.message}")
-                null
-            }
+            println("Summary обновлен: ${appSettings.summaryPath.toAbsolutePath()}")
+        }
+        return
+    }
 
-            if (remainingMessages != null && remainingMessages != messagesBeforeStartupCompact) {
-                println("История сжата при старте. Сообщений осталось в JSON: $remainingMessages")
-                println("Summary обновлен: ${appSettings.summaryPath.toAbsolutePath()}")
-            }
+    if (appSettings.contextStrategy == ContextStrategyType.SUMMARY) {
+        val messagesBeforeStartupCompact = agent.messageCount
+        val remainingMessages = try {
+            agent.compactHistoryIfNeeded()
+        } catch (error: Exception) {
+            System.err.println("Ошибка сжатия истории: ${error.message}")
+            null
         }
 
-        while (true) {
+        if (remainingMessages != null && remainingMessages != messagesBeforeStartupCompact) {
+            println("История сжата при старте. Сообщений осталось в JSON: $remainingMessages")
+            println("Summary обновлен: ${appSettings.summaryPath.toAbsolutePath()}")
+        }
+    }
+
+    while (true) {
         print("Вы: ")
         val input = readLine() ?: break
         val userText = input.trim()
@@ -105,12 +127,25 @@ fun main(args: Array<String>) {
 
         if (userText in EXIT_COMMANDS) {
             println("Диалог завершен.")
+            askWhetherTaskIsSolved(memory)
             break
         }
 
         if (branchStore != null && handleBranchCommand(userText, branchStore, agent)) {
             continue
         }
+
+        try {
+            if (handleMemoryCommand(userText, memory, memoryFormatter)) {
+                continue
+            }
+        } catch (error: IllegalArgumentException) {
+            System.err.println("Ошибка: ${error.message}")
+            println()
+            continue
+        }
+
+        captureImplicitMemory(userText, memory)
 
         try {
             val tokenReport = agent.previewTokens(userText)
@@ -144,6 +179,22 @@ fun main(args: Array<String>) {
 
     println()
     printDialogStats(settings, dialogStats)
+}
+
+private fun askWhetherTaskIsSolved(memory: AssistantMemory) {
+    if (memory.working.isEmpty()) {
+        return
+    }
+
+    print("Текущая задача решена? Очистить WorkingMemory? [y/N]: ")
+    val answer = readLine()?.trim()?.lowercase().orEmpty()
+
+    if (answer in setOf("y", "yes", "д", "да")) {
+        memory.working.clear()
+        println("WorkingMemory очищена.")
+    } else {
+        println("WorkingMemory сохранена для следующей сессии.")
+    }
 }
 
 private fun buildContextManager(
@@ -207,6 +258,145 @@ private fun handleBranchCommand(
     }
 }
 
+private fun handleMemoryCommand(
+    input: String,
+    memory: AssistantMemory,
+    formatter: MemoryStatusFormatter,
+): Boolean {
+    val trimmed = input.trim()
+    val parts = trimmed.split(Regex("\\s+"), limit = 3).filter { it.isNotBlank() }
+
+    if (parts.isEmpty()) {
+        return false
+    }
+
+    fun recordCommandResult(answer: String) {
+        memory.shortTerm.add(ChatMessage(role = "user", content = trimmed))
+        memory.shortTerm.add(ChatMessage(role = "assistant", content = answer))
+        println(answer)
+        println()
+    }
+
+    return when {
+        parts[0] == "/memory-status" || parts[0] == "memory-status" -> {
+            println(formatter.format(memory))
+            println()
+            true
+        }
+
+        parts[0] == "/work" && parts.getOrNull(1) == "clear" -> {
+            memory.working.clear()
+            recordCommandResult("WorkingMemory очищена.")
+            true
+        }
+
+        parts[0] == "/work" && parts.getOrNull(1) == "flag" && parts.size == 3 -> {
+            val (key, value) = splitKeyValue(parts[2], "/work flag")
+            memory.working.setFlag(key, parseBooleanFlag(value))
+            recordCommandResult("Флаг WorkingMemory сохранен: $key = ${parseBooleanFlag(value)}")
+            true
+        }
+
+        parts[0] == "/work" && parts.size == 3 -> {
+            val layer = parts[1]
+            val (key, value) = splitKeyValue(parts[2], "/work $layer")
+
+            when (layer) {
+                "context" -> memory.working.putContext(key, value)
+                "result" -> memory.working.putResult(key, value)
+                else -> return false
+            }
+
+            recordCommandResult("WorkingMemory сохранена: $layer.$key")
+            true
+        }
+
+        parts[0] == "/profile" && parts.size >= 2 -> {
+            val (key, value) = splitKeyValue(trimmed.removePrefix("/profile").trim(), "/profile")
+            memory.longTerm.rememberProfile(key, value)
+            recordCommandResult("LongTermMemory.profile сохранен: $key")
+            true
+        }
+
+        parts[0] == "/decision" && parts.size >= 2 -> {
+            val (key, value) = splitKeyValue(trimmed.removePrefix("/decision").trim(), "/decision")
+            memory.longTerm.rememberDecision(key, value)
+            recordCommandResult("LongTermMemory.decisions сохранено: $key")
+            true
+        }
+
+        parts[0] == "/knowledge" && parts.size >= 2 -> {
+            val (key, value) = splitKeyValue(trimmed.removePrefix("/knowledge").trim(), "/knowledge")
+            memory.longTerm.rememberKnowledge(key, value)
+            recordCommandResult("LongTermMemory.knowledge сохранено: $key")
+            true
+        }
+
+        else -> false
+    }
+}
+
+private fun captureImplicitMemory(input: String, memory: AssistantMemory) {
+    val lower = input.lowercase()
+
+    when {
+        lower.startsWith("запомни результат поиска") -> {
+            val value = input.substringAfter(":", missingDelimiterValue = "")
+                .ifBlank { input.substringAfter("запомни результат поиска", missingDelimiterValue = "").trim() }
+
+            if (value.isNotBlank()) {
+                memory.working.putResult("searchResult", value)
+            }
+        }
+
+        lower.startsWith("запомни в профиль") -> {
+            splitKeyValueOrNull(input.substringAfter("запомни в профиль"))?.let { (key, value) ->
+                memory.longTerm.rememberProfile(key, value)
+            }
+        }
+
+        lower.startsWith("запомни знание") -> {
+            splitKeyValueOrNull(input.substringAfter("запомни знание"))?.let { (key, value) ->
+                memory.longTerm.rememberKnowledge(key, value)
+            }
+        }
+
+        lower.startsWith("запомни решение") -> {
+            splitKeyValueOrNull(input.substringAfter("запомни решение"))?.let { (key, value) ->
+                memory.longTerm.rememberDecision(key, value)
+            }
+        }
+    }
+}
+
+private fun splitKeyValue(input: String, commandName: String): Pair<String, String> {
+    return splitKeyValueOrNull(input)
+        ?: throw IllegalArgumentException("$commandName ожидает формат key=value или key: value")
+}
+
+private fun splitKeyValueOrNull(input: String): Pair<String, String>? {
+    val delimiterIndex = listOf(
+        input.indexOf('='),
+        input.indexOf(':'),
+    ).filter { it >= 0 }.minOrNull() ?: return null
+    val key = input.substring(0, delimiterIndex).trim()
+    val value = input.substring(delimiterIndex + 1).trim()
+
+    if (key.isBlank() || value.isBlank()) {
+        return null
+    }
+
+    return key to value
+}
+
+private fun parseBooleanFlag(value: String): Boolean {
+    return when (value.trim().lowercase()) {
+        "true", "yes", "on", "1", "да", "истина" -> true
+        "false", "no", "off", "0", "нет", "ложь" -> false
+        else -> throw IllegalArgumentException("флаг должен быть true/false")
+    }
+}
+
 private fun parseArgs(args: Array<String>): AppSettings {
     var model = DEFAULT_MODEL
     var thinking = DEFAULT_THINKING
@@ -218,6 +408,9 @@ private fun parseArgs(args: Array<String>): AppSettings {
     var factsPath = Path.of(DEFAULT_FACTS_FILE)
     var branchDir = Path.of(DEFAULT_BRANCH_DIR)
     var branchName = DEFAULT_BRANCH_NAME
+    var memoryDir = Path.of(DEFAULT_MEMORY_DIR)
+    var memoryUser = DEFAULT_MEMORY_USER
+    var memoryStatus = false
     var contextStrategy = ContextStrategyType.FULL
     var allowOverLimit = false
     var dryRunTokens = false
@@ -393,6 +586,40 @@ private fun parseArgs(args: Array<String>): AppSettings {
                 index++
             }
 
+            arg == "--memory-dir" -> {
+                val value = args.getOrNull(index + 1)
+                    ?: throw IllegalArgumentException("после --memory-dir нужно указать путь к папке")
+                memoryDir = parsePath(value, "--memory-dir")
+                index += 2
+            }
+
+            arg.startsWith("--memory-dir=") -> {
+                memoryDir = parsePath(arg.substringAfter("="), "--memory-dir")
+                index++
+            }
+
+            arg == "--user" || arg == "--memory-user" -> {
+                val value = args.getOrNull(index + 1)
+                    ?: throw IllegalArgumentException("после $arg нужно указать пользователя")
+                memoryUser = parseName(value, arg)
+                index += 2
+            }
+
+            arg.startsWith("--user=") -> {
+                memoryUser = parseName(arg.substringAfter("="), "--user")
+                index++
+            }
+
+            arg.startsWith("--memory-user=") -> {
+                memoryUser = parseName(arg.substringAfter("="), "--memory-user")
+                index++
+            }
+
+            arg == "--memory-status" || arg == "memory-status" -> {
+                memoryStatus = true
+                index++
+            }
+
             arg == "--summary-chunk-size" -> {
                 val value = args.getOrNull(index + 1)
                     ?: throw IllegalArgumentException("после --summary-chunk-size нужно указать число")
@@ -428,6 +655,9 @@ private fun parseArgs(args: Array<String>): AppSettings {
         factsPath = factsPath,
         branchDir = branchDir,
         branchName = branchName,
+        memoryDir = memoryDir,
+        memoryUser = memoryUser,
+        memoryStatus = memoryStatus,
         contextStrategy = contextStrategy,
         allowOverLimit = allowOverLimit,
         dryRunTokens = dryRunTokens,
