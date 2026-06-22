@@ -38,7 +38,9 @@ class DeepSeekAgent(
 
     fun previewTokens(userText: String): TokenReport {
         val userMessage = ChatMessage(role = "user", content = userText)
-        val contextPrompt = contextManager.buildPrompt(messages, userMessage)
+        val contextPrompt = contextManager
+            .buildPrompt(messages, userMessage)
+            .withUserProfile(memory.loadUserProfileIntoWorking())
         val currentRequestTokens = tokenCounter.countMessage(userMessage)
         val fullHistoryTokens = tokenCounter.countMessages(messages)
         val promptTokens = tokenCounter.countMessages(contextPrompt.messages)
@@ -67,7 +69,9 @@ class DeepSeekAgent(
 
         val userMessage = ChatMessage(role = "user", content = userText)
         memory.shortTerm.add(userMessage)
-        val contextPrompt = contextManager.buildPrompt(messages, userMessage)
+        val contextPrompt = contextManager
+            .buildPrompt(messages, userMessage)
+            .withUserProfile(memory.loadUserProfileIntoWorking())
         val response = client.complete(contextPrompt.messages, settings)
         val assistantMessage = ChatMessage(role = "assistant", content = response.answer)
 
@@ -78,5 +82,20 @@ class DeepSeekAgent(
         messageStore.save(messages)
 
         return response
+    }
+
+    private fun ContextPrompt.withUserProfile(profile: UserProfile?): ContextPrompt {
+        if (profile == null) {
+            return this
+        }
+
+        return copy(
+            messages = listOf(
+                ChatMessage(
+                    role = "system",
+                    content = profile.toSystemInstruction(),
+                ),
+            ) + messages,
+        )
     }
 }

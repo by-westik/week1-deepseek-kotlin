@@ -2,26 +2,33 @@ import java.nio.file.Path
 import java.util.Locale
 import kotlin.system.exitProcess
 
+private val PROFILE_FIELDS = setOf("tone", "gender", "length", "language", "lang", "notes", "note")
+
 fun main(args: Array<String>) {
-    val appSettings = try {
+    val parsedSettings = try {
         parseArgs(args)
     } catch (error: IllegalArgumentException) {
         System.err.println("Ошибка: ${error.message}")
         exitProcess(1)
     }
+    val baseLongTermStore = LongTermMemoryStore(parsedSettings.memoryDir)
+    val memoryUser = baseLongTermStore.sanitizeUserId(parsedSettings.memoryUser)
+    val appSettings = parsedSettings.withUserScopedDefaults(memoryUser)
     val longTermStore = LongTermMemoryStore(appSettings.memoryDir)
     val workingStore = WorkingMemoryStore(appSettings.memoryDir)
-    val memoryUser = longTermStore.sanitizeUserId(appSettings.memoryUser)
     val memory = AssistantMemory(
         shortTerm = ShortTermMemory(),
         working = WorkingMemory(userId = memoryUser, store = workingStore),
         longTerm = LongTermMemory(userId = memoryUser, store = longTermStore),
     )
+    memory.loadUserProfileIntoWorking()
     val memoryFormatter = MemoryStatusFormatter()
 
     if (appSettings.memoryStatus) {
         println(memoryFormatter.format(memory))
         println()
+        println("User workspace: ${longTermStore.userDir(memoryUser).toAbsolutePath()}")
+        println("History file: ${appSettings.historyPath.toAbsolutePath()}")
         println("Working memory file: ${workingStore.userPath(memoryUser).toAbsolutePath()}")
         println("Long-term memory file: ${longTermStore.userPath(memoryUser).toAbsolutePath()}")
         return
@@ -69,6 +76,7 @@ fun main(args: Array<String>) {
 
     println("DeepSeek Agent")
     println("Введите сообщение. Для выхода: /exit, /quit или пустой EOF.")
+    println("Папка пользователя: ${longTermStore.userDir(memoryUser).toAbsolutePath()}")
     println("История: ${appSettings.historyPath.toAbsolutePath()}")
     println("Пользователь памяти: $memoryUser")
     println("Рабочая память: ${workingStore.userPath(memoryUser).toAbsolutePath()}")
@@ -89,6 +97,9 @@ fun main(args: Array<String>) {
         println("Facts tokens: ${tokenCounter.countText(agent.summaryText)}")
     } else {
         println("Компрессия контекста: выключена")
+    }
+    if (memory.working.userProfile() == null) {
+        println("Профиль пользователя не найден. Перед первым обычным запросом запустится онбординг.")
     }
     println()
 
@@ -145,6 +156,7 @@ fun main(args: Array<String>) {
             continue
         }
 
+        ensureUserProfileForRequest(memory)
         captureImplicitMemory(userText, memory)
 
         try {
@@ -195,6 +207,93 @@ private fun askWhetherTaskIsSolved(memory: AssistantMemory) {
     } else {
         println("WorkingMemory сохранена для следующей сессии.")
     }
+}
+
+private fun ensureUserProfileForRequest(memory: AssistantMemory): UserProfile {
+    memory.loadUserProfileIntoWorking()?.let { profile ->
+        return profile
+    }
+
+    val profile = runUserProfileOnboarding(memory)
+    memory.longTerm.saveUserProfile(profile)
+    memory.loadUserProfileIntoWorking()
+    println("Профиль сохранен.")
+    println()
+
+    return profile
+}
+
+private fun runUserProfileOnboarding(memory: AssistantMemory): UserProfile {
+    println("Давайте настроим персонализацию ответов. Можно нажимать Enter, чтобы оставить значение по умолчанию.")
+    println()
+
+    val tone = askOnboardingQuestion(
+        memory = memory,
+        question = "Тон общения: 1 - формальный, 2 - дружелюбный, 3 - нейтральный [по умолчанию: 3]",
+        defaultValue = Tone.Neutral,
+        parser = { Tone.fromInput(it) },
+    )
+    val gender = askOnboardingQuestion(
+        memory = memory,
+        question = "Пол ассистента: 1 - мужской, 2 - женский, 3 - без рода [по умолчанию: 3]",
+        defaultValue = AssistantGender.None,
+        parser = { AssistantGender.fromInput(it) },
+    )
+    val length = askOnboardingQuestion(
+        memory = memory,
+        question = "Длина ответа: 1 - кратко, 2 - обычно, 3 - подробно [по умолчанию: 2]",
+        defaultValue = AnswerLength.Normal,
+        parser = { AnswerLength.fromInput(it) },
+    )
+    val languageAnswer = askOnboardingText(
+        memory = memory,
+        question = "Язык ответов, например ru или en [по умолчанию: ru]",
+    )
+    val notes = askOnboardingText(
+        memory = memory,
+        question = "Дополнительные пожелания к стилю [можно пропустить]",
+    )
+
+    return UserProfile(
+        tone = tone,
+        gender = gender,
+        length = length,
+        language = languageAnswer.ifBlank { "ru" },
+        notes = notes,
+    )
+}
+
+private fun <T> askOnboardingQuestion(
+    memory: AssistantMemory,
+    question: String,
+    defaultValue: T,
+    parser: (String) -> T,
+): T {
+    val answer = askOnboardingText(memory, question)
+
+    if (answer.isBlank()) {
+        return defaultValue
+    }
+
+    return try {
+        parser(answer)
+    } catch (error: IllegalArgumentException) {
+        println("Не распознала ответ, оставляю значение по умолчанию: $defaultValue")
+        defaultValue
+    }
+}
+
+private fun askOnboardingText(
+    memory: AssistantMemory,
+    question: String,
+): String {
+    println(question)
+    print("> ")
+    memory.shortTerm.add(ChatMessage(role = "assistant", content = question))
+    val answer = readLine()?.trim().orEmpty()
+    memory.shortTerm.add(ChatMessage(role = "user", content = answer.ifBlank { "(пропущено)" }))
+
+    return answer
 }
 
 private fun buildContextManager(
@@ -311,10 +410,9 @@ private fun handleMemoryCommand(
             true
         }
 
-        parts[0] == "/profile" && parts.size >= 2 -> {
-            val (key, value) = splitKeyValue(trimmed.removePrefix("/profile").trim(), "/profile")
-            memory.longTerm.rememberProfile(key, value)
-            recordCommandResult("LongTermMemory.profile сохранен: $key")
+        parts[0] == "/profile" -> {
+            val answer = handleProfileCommand(trimmed, parts, memory)
+            recordCommandResult(answer)
             true
         }
 
@@ -334,6 +432,55 @@ private fun handleMemoryCommand(
 
         else -> false
     }
+}
+
+private fun handleProfileCommand(
+    input: String,
+    parts: List<String>,
+    memory: AssistantMemory,
+): String {
+    if (parts.size == 1) {
+        val profile = memory.loadUserProfileIntoWorking()
+
+        return if (profile == null) {
+            "Профиль пользователя отсутствует. Онбординг запустится перед следующим обычным запросом."
+        } else {
+            "Текущий профиль:\n${profile.toDisplayText()}"
+        }
+    }
+
+    val command = parts[1].lowercase()
+
+    if (command == "reset") {
+        memory.longTerm.deleteUserProfile()
+        memory.working.clearUserProfile()
+        return "Профиль пользователя удален. Онбординг запустится перед следующим обычным запросом."
+    }
+
+    if (parts.size >= 3 && command in PROFILE_FIELDS) {
+        val currentProfile = memory.longTerm.loadUserProfile() ?: UserProfile()
+        val updatedProfile = currentProfile.withField(command, parts[2])
+        memory.longTerm.saveUserProfile(updatedProfile)
+        memory.loadUserProfileIntoWorking()
+
+        return "Профиль обновлен:\n${updatedProfile.toDisplayText()}"
+    }
+
+    splitKeyValueOrNull(input.removePrefix("/profile").trim())?.let { (key, value) ->
+        if (key.lowercase() in PROFILE_FIELDS) {
+            val currentProfile = memory.longTerm.loadUserProfile() ?: UserProfile()
+            val updatedProfile = currentProfile.withField(key, value)
+            memory.longTerm.saveUserProfile(updatedProfile)
+            memory.loadUserProfileIntoWorking()
+
+            return "Профиль обновлен:\n${updatedProfile.toDisplayText()}"
+        }
+
+        memory.longTerm.rememberProfile(key, value)
+        return "LongTermMemory.profile сохранен: $key"
+    }
+
+    throw IllegalArgumentException("/profile ожидает поле tone/gender/length/language/notes, reset или формат key=value")
 }
 
 private fun captureImplicitMemory(input: String, memory: AssistantMemory) {
@@ -397,6 +544,17 @@ private fun parseBooleanFlag(value: String): Boolean {
     }
 }
 
+private fun AppSettings.withUserScopedDefaults(memoryUser: String): AppSettings {
+    val userDir = memoryDir.resolve(memoryUser)
+
+    return copy(
+        historyPath = if (historyPathExplicit) historyPath else userDir.resolve(DEFAULT_HISTORY_FILE),
+        summaryPath = if (summaryPathExplicit) summaryPath else userDir.resolve(DEFAULT_SUMMARY_FILE),
+        factsPath = if (factsPathExplicit) factsPath else userDir.resolve(DEFAULT_FACTS_FILE),
+        branchDir = if (branchDirExplicit) branchDir else userDir.resolve(DEFAULT_BRANCH_DIR),
+    )
+}
+
 private fun parseArgs(args: Array<String>): AppSettings {
     var model = DEFAULT_MODEL
     var thinking = DEFAULT_THINKING
@@ -411,6 +569,10 @@ private fun parseArgs(args: Array<String>): AppSettings {
     var memoryDir = Path.of(DEFAULT_MEMORY_DIR)
     var memoryUser = DEFAULT_MEMORY_USER
     var memoryStatus = false
+    var historyPathExplicit = false
+    var summaryPathExplicit = false
+    var factsPathExplicit = false
+    var branchDirExplicit = false
     var contextStrategy = ContextStrategyType.FULL
     var allowOverLimit = false
     var dryRunTokens = false
@@ -488,11 +650,13 @@ private fun parseArgs(args: Array<String>): AppSettings {
                 val value = args.getOrNull(index + 1)
                     ?: throw IllegalArgumentException("после --history-file нужно указать путь к JSON-файлу")
                 historyPath = parseHistoryPath(value)
+                historyPathExplicit = true
                 index += 2
             }
 
             arg.startsWith("--history-file=") -> {
                 historyPath = parseHistoryPath(arg.substringAfter("="))
+                historyPathExplicit = true
                 index++
             }
 
@@ -542,11 +706,13 @@ private fun parseArgs(args: Array<String>): AppSettings {
                 val value = args.getOrNull(index + 1)
                     ?: throw IllegalArgumentException("после --summary-file нужно указать путь к txt-файлу")
                 summaryPath = parseSummaryPath(value)
+                summaryPathExplicit = true
                 index += 2
             }
 
             arg.startsWith("--summary-file=") -> {
                 summaryPath = parseSummaryPath(arg.substringAfter("="))
+                summaryPathExplicit = true
                 index++
             }
 
@@ -554,11 +720,13 @@ private fun parseArgs(args: Array<String>): AppSettings {
                 val value = args.getOrNull(index + 1)
                     ?: throw IllegalArgumentException("после --facts-file нужно указать путь к JSON-файлу")
                 factsPath = parsePath(value, "--facts-file")
+                factsPathExplicit = true
                 index += 2
             }
 
             arg.startsWith("--facts-file=") -> {
                 factsPath = parsePath(arg.substringAfter("="), "--facts-file")
+                factsPathExplicit = true
                 index++
             }
 
@@ -566,11 +734,13 @@ private fun parseArgs(args: Array<String>): AppSettings {
                 val value = args.getOrNull(index + 1)
                     ?: throw IllegalArgumentException("после --branch-dir нужно указать путь к папке")
                 branchDir = parsePath(value, "--branch-dir")
+                branchDirExplicit = true
                 index += 2
             }
 
             arg.startsWith("--branch-dir=") -> {
                 branchDir = parsePath(arg.substringAfter("="), "--branch-dir")
+                branchDirExplicit = true
                 index++
             }
 
@@ -658,6 +828,10 @@ private fun parseArgs(args: Array<String>): AppSettings {
         memoryDir = memoryDir,
         memoryUser = memoryUser,
         memoryStatus = memoryStatus,
+        historyPathExplicit = historyPathExplicit,
+        summaryPathExplicit = summaryPathExplicit,
+        factsPathExplicit = factsPathExplicit,
+        branchDirExplicit = branchDirExplicit,
         contextStrategy = contextStrategy,
         allowOverLimit = allowOverLimit,
         dryRunTokens = dryRunTokens,

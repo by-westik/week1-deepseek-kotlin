@@ -3,6 +3,160 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Instant
 
+const val USER_PROFILE_MEMORY_KEY = "user_profile"
+const val USER_PROFILE_MEMORY_SOURCE = "LongTermMemory.profile[user_profile]"
+
+/** Preferred communication tone for assistant answers. */
+enum class Tone {
+    Formal,
+    Friendly,
+    Neutral,
+    ;
+
+    companion object {
+        fun fromInput(value: String): Tone {
+            return when (value.trim().lowercase()) {
+                "1", "formal", "formally", "формальный", "формально" -> Formal
+                "2", "friendly", "friend", "дружелюбный", "дружелюбно" -> Friendly
+                "3", "neutral", "нейтральный", "нейтрально" -> Neutral
+                else -> throw IllegalArgumentException("tone должен быть Formal, Friendly или Neutral")
+            }
+        }
+    }
+}
+
+/** Grammatical gender the assistant should use for self-references. */
+enum class AssistantGender {
+    Male,
+    Female,
+    None,
+    ;
+
+    companion object {
+        fun fromInput(value: String): AssistantGender {
+            return when (value.trim().lowercase()) {
+                "1", "male", "мужской", "муж", "он" -> Male
+                "2", "female", "женский", "жен", "она" -> Female
+                "3", "none", "neutral", "без", "нет", "нейтральный" -> None
+                else -> throw IllegalArgumentException("gender должен быть Male, Female или None")
+            }
+        }
+    }
+}
+
+/** Preferred answer length. */
+enum class AnswerLength {
+    Short,
+    Normal,
+    Detailed,
+    ;
+
+    companion object {
+        fun fromInput(value: String): AnswerLength {
+            return when (value.trim().lowercase()) {
+                "1", "short", "brief", "кратко", "коротко", "краткий" -> Short
+                "2", "normal", "обычно", "нормально", "средне" -> Normal
+                "3", "detailed", "detail", "подробно", "детально", "развернуто", "развёрнуто" -> Detailed
+                else -> throw IllegalArgumentException("length должен быть Short, Normal или Detailed")
+            }
+        }
+    }
+}
+
+/**
+ * Persistent personalization settings for one user.
+ *
+ * The profile is stored in LongTermMemory under [USER_PROFILE_MEMORY_KEY] and
+ * loaded into WorkingMemory before ordinary assistant requests.
+ */
+data class UserProfile(
+    val tone: Tone = Tone.Neutral,
+    val gender: AssistantGender = AssistantGender.None,
+    val length: AnswerLength = AnswerLength.Normal,
+    val language: String = "ru",
+    val notes: String = "",
+) {
+    /** Returns a copy with one field changed by a CLI value. */
+    fun withField(field: String, value: String): UserProfile {
+        return when (field.trim().lowercase()) {
+            "tone" -> copy(tone = Tone.fromInput(value))
+            "gender" -> copy(gender = AssistantGender.fromInput(value))
+            "length" -> copy(length = AnswerLength.fromInput(value))
+            "language", "lang" -> copy(language = normalizeLanguage(value))
+            "notes", "note" -> copy(notes = value.trim())
+            else -> throw IllegalArgumentException("поле профиля должно быть tone, gender, length, language или notes")
+        }
+    }
+
+    /** Builds the system instruction used for personalized model answers. */
+    fun toSystemInstruction(): String {
+        val toneInstruction = when (tone) {
+            Tone.Formal -> "Пиши формально, спокойно и без эмодзи."
+            Tone.Friendly -> "Пиши дружелюбно и тепло; можно использовать уместные эмодзи."
+            Tone.Neutral -> "Пиши нейтрально и по делу."
+        }
+        val genderInstruction = when (gender) {
+            AssistantGender.Male -> "Если говоришь о себе, используй мужской род."
+            AssistantGender.Female -> "Если говоришь о себе, используй женский род."
+            AssistantGender.None -> "Избегай гендерно окрашенных формулировок о себе."
+        }
+        val lengthInstruction = when (length) {
+            AnswerLength.Short -> "Отвечай кратко: 1-3 коротких абзаца или пункта."
+            AnswerLength.Normal -> "Отвечай обычной длиной: достаточно деталей без лишнего разрастания."
+            AnswerLength.Detailed -> "Отвечай подробно: раскрывай причины, шаги и важные нюансы."
+        }
+        val notesInstruction = notes.takeIf { it.isNotBlank() }
+            ?.let { "Дополнительные пожелания пользователя: $it" }
+            ?: "Дополнительных пожеланий нет."
+
+        return """
+            Персонализация ответа для текущего пользователя:
+            - Язык ответа: $language.
+            - Тон: $tone. $toneInstruction
+            - Род ассистента: $gender. $genderInstruction
+            - Длина ответа: $length. $lengthInstruction
+            - $notesInstruction
+            Следуй этим настройкам во всех ответах, если запрос пользователя явно не просит другое.
+        """.trimIndent()
+    }
+
+    /** Formats the profile for CLI output. */
+    fun toDisplayText(): String {
+        return """
+            tone = $tone
+            gender = $gender
+            length = $length
+            language = $language
+            notes = ${notes.ifBlank { "(пусто)" }}
+        """.trimIndent()
+    }
+
+    /** Serializes the profile for storage in LongTermMemory. */
+    fun toJsonString(): String {
+        return toJsonObject().toString()
+    }
+
+    companion object {
+        fun fromJsonString(value: String): UserProfile? {
+            return runCatching { fromJsonObject(JSONObject(value)) }.getOrNull()
+        }
+
+        fun fromJsonObject(json: JSONObject): UserProfile {
+            return UserProfile(
+                tone = Tone.fromInput(json.optString("tone", Tone.Neutral.name)),
+                gender = AssistantGender.fromInput(json.optString("gender", AssistantGender.None.name)),
+                length = AnswerLength.fromInput(json.optString("length", AnswerLength.Normal.name)),
+                language = normalizeLanguage(json.optString("language", "ru")),
+                notes = json.optString("notes", ""),
+            )
+        }
+
+        private fun normalizeLanguage(value: String): String {
+            return value.trim().lowercase().ifBlank { "ru" }
+        }
+    }
+}
+
 /**
  * In-memory transcript for the current process.
  *
@@ -88,6 +242,36 @@ class WorkingMemory(
         return snapshot.flags
     }
 
+    /** Stores the profile currently loaded from long-term memory for request handling. */
+    fun putUserProfile(profile: UserProfile, source: String) {
+        snapshot = snapshot.copy(
+            loadedUserProfile = profile,
+            userProfileSource = source,
+            updatedAt = Instant.now().toString(),
+        )
+        persist()
+    }
+
+    /** Removes only the loaded profile view from working memory. */
+    fun clearUserProfile() {
+        snapshot = snapshot.copy(
+            loadedUserProfile = null,
+            userProfileSource = null,
+            updatedAt = Instant.now().toString(),
+        )
+        persist()
+    }
+
+    /** Returns the profile loaded into working memory for the current request. */
+    fun userProfile(): UserProfile? {
+        return snapshot.loadedUserProfile
+    }
+
+    /** Returns where the loaded profile came from. */
+    fun userProfileSource(): String? {
+        return snapshot.userProfileSource
+    }
+
     /** Returns true when the current task has no stored context, results, or flags. */
     fun isEmpty(): Boolean {
         return snapshot.context.isEmpty() && snapshot.intermediateResults.isEmpty() && snapshot.flags.isEmpty()
@@ -97,6 +281,8 @@ class WorkingMemory(
     fun clear() {
         snapshot = WorkingMemorySnapshot(
             userId = snapshot.userId,
+            loadedUserProfile = snapshot.loadedUserProfile,
+            userProfileSource = snapshot.userProfileSource,
             createdAt = snapshot.createdAt,
             updatedAt = Instant.now().toString(),
         )
@@ -116,6 +302,8 @@ data class WorkingMemorySnapshot(
     val context: Map<String, String> = emptyMap(),
     val intermediateResults: Map<String, String> = emptyMap(),
     val flags: Map<String, Boolean> = emptyMap(),
+    val loadedUserProfile: UserProfile? = null,
+    val userProfileSource: String? = null,
     val createdAt: String = Instant.now().toString(),
     val updatedAt: String = createdAt,
 )
@@ -125,9 +313,13 @@ class WorkingMemoryStore(private val memoryDir: Path) {
     /** Loads unfinished task memory for a user, or returns an empty task snapshot. */
     fun load(userId: String): WorkingMemorySnapshot {
         val safeUserId = sanitizeUserId(userId)
-        val path = userPath(safeUserId)
+        val path = when {
+            Files.exists(userPath(safeUserId)) -> userPath(safeUserId)
+            Files.exists(legacyUserPath(safeUserId)) -> legacyUserPath(safeUserId)
+            else -> null
+        }
 
-        if (!Files.exists(path)) {
+        if (path == null) {
             return WorkingMemorySnapshot(userId = safeUserId)
         }
 
@@ -138,6 +330,8 @@ class WorkingMemoryStore(private val memoryDir: Path) {
             context = json.optJSONObject("context").toStringMap(),
             intermediateResults = json.optJSONObject("intermediateResults").toStringMap(),
             flags = json.optJSONObject("flags").toBooleanMap(),
+            loadedUserProfile = json.optJSONObject("loadedUserProfile")?.let { UserProfile.fromJsonObject(it) },
+            userProfileSource = json.optString("userProfileSource").ifBlank { null },
             createdAt = json.optString("createdAt", Instant.now().toString()),
             updatedAt = json.optString("updatedAt", Instant.now().toString()),
         )
@@ -146,13 +340,19 @@ class WorkingMemoryStore(private val memoryDir: Path) {
     /** Persists unfinished task memory for one user as pretty-printed JSON. */
     fun save(userId: String, snapshot: WorkingMemorySnapshot) {
         val safeUserId = sanitizeUserId(userId)
-        Files.createDirectories(memoryDir)
-        Files.writeString(userPath(safeUserId), snapshot.toJson().toString(2))
+        val path = userPath(safeUserId)
+        Files.createDirectories(path.parent)
+        Files.writeString(path, snapshot.toJson().toString(2))
     }
 
     /** Resolves the JSON path for a sanitized user id. */
     fun userPath(userId: String): Path {
-        return memoryDir.resolve("working-${sanitizeUserId(userId)}.json")
+        return userDir(userId).resolve(DEFAULT_WORKING_MEMORY_FILE)
+    }
+
+    /** Resolves the per-user workspace directory. */
+    fun userDir(userId: String): Path {
+        return memoryDir.resolve(sanitizeUserId(userId))
     }
 
     /** Converts arbitrary CLI input into a stable, filesystem-safe user id. */
@@ -164,6 +364,10 @@ class WorkingMemoryStore(private val memoryDir: Path) {
         }
 
         return sanitized
+    }
+
+    private fun legacyUserPath(userId: String): Path {
+        return memoryDir.resolve("working-${sanitizeUserId(userId)}.json")
     }
 }
 
@@ -214,6 +418,25 @@ class LongTermMemory(
         )
         store.save(userId, snapshot)
     }
+
+    /** Loads the structured personalization profile from long-term memory. */
+    fun loadUserProfile(): UserProfile? {
+        return snapshot.profile[USER_PROFILE_MEMORY_KEY]?.let(UserProfile::fromJsonString)
+    }
+
+    /** Saves the structured personalization profile in long-term memory. */
+    fun saveUserProfile(profile: UserProfile) {
+        rememberProfile(USER_PROFILE_MEMORY_KEY, profile.toJsonString())
+    }
+
+    /** Deletes only the structured personalization profile from long-term memory. */
+    fun deleteUserProfile() {
+        snapshot = snapshot.copy(
+            profile = snapshot.profile - USER_PROFILE_MEMORY_KEY,
+            updatedAt = Instant.now().toString(),
+        )
+        store.save(userId, snapshot)
+    }
 }
 
 /** Durable contents of one user's long-term memory file. */
@@ -231,9 +454,13 @@ class LongTermMemoryStore(private val memoryDir: Path) {
     /** Loads memory for a user, creating an empty snapshot if no file exists yet. */
     fun load(userId: String): LongTermMemorySnapshot {
         val safeUserId = sanitizeUserId(userId)
-        val path = userPath(safeUserId)
+        val path = when {
+            Files.exists(userPath(safeUserId)) -> userPath(safeUserId)
+            Files.exists(legacyUserPath(safeUserId)) -> legacyUserPath(safeUserId)
+            else -> null
+        }
 
-        if (!Files.exists(path)) {
+        if (path == null) {
             return LongTermMemorySnapshot(userId = safeUserId)
         }
 
@@ -252,8 +479,9 @@ class LongTermMemoryStore(private val memoryDir: Path) {
     /** Persists memory for one user as pretty-printed JSON. */
     fun save(userId: String, snapshot: LongTermMemorySnapshot) {
         val safeUserId = sanitizeUserId(userId)
-        Files.createDirectories(memoryDir)
-        Files.writeString(userPath(safeUserId), snapshot.toJson().toString(2))
+        val path = userPath(safeUserId)
+        Files.createDirectories(path.parent)
+        Files.writeString(path, snapshot.toJson().toString(2))
     }
 
     /** Returns all known user ids based on files already present in memoryDir. */
@@ -262,18 +490,31 @@ class LongTermMemoryStore(private val memoryDir: Path) {
             return emptyList()
         }
 
-        return Files.list(memoryDir).use { paths ->
+        val userDirs = Files.list(memoryDir).use { paths ->
             paths
-                .filter { path -> path.fileName.toString().endsWith(".json") }
-                .map { path -> path.fileName.toString().removeSuffix(".json") }
-                .sorted()
+                .filter { path -> Files.isDirectory(path) }
+                .map { path -> path.fileName.toString() }
                 .toList()
         }
+        val legacyFiles = Files.list(memoryDir).use { paths ->
+            paths
+                .filter { path -> path.fileName.toString().endsWith(".json") }
+                .filter { path -> !path.fileName.toString().startsWith("working-") }
+                .map { path -> path.fileName.toString().removeSuffix(".json") }
+                .toList()
+        }
+
+        return (userDirs + legacyFiles).distinct().sorted()
     }
 
     /** Resolves the JSON path for a sanitized user id. */
     fun userPath(userId: String): Path {
-        return memoryDir.resolve("${sanitizeUserId(userId)}.json")
+        return userDir(userId).resolve(DEFAULT_LONG_TERM_MEMORY_FILE)
+    }
+
+    /** Resolves the per-user workspace directory. */
+    fun userDir(userId: String): Path {
+        return memoryDir.resolve(sanitizeUserId(userId))
     }
 
     /** Converts arbitrary CLI input into a stable, filesystem-safe user id. */
@@ -286,6 +527,10 @@ class LongTermMemoryStore(private val memoryDir: Path) {
 
         return sanitized
     }
+
+    private fun legacyUserPath(userId: String): Path {
+        return memoryDir.resolve("${sanitizeUserId(userId)}.json")
+    }
 }
 
 /** Groups the three memory layers so call sites can choose a layer explicitly. */
@@ -293,7 +538,20 @@ data class AssistantMemory(
     val shortTerm: ShortTermMemory,
     val working: WorkingMemory,
     val longTerm: LongTermMemory,
-)
+) {
+    /** Loads the persistent user profile into the working layer for request handling. */
+    fun loadUserProfileIntoWorking(): UserProfile? {
+        val profile = longTerm.loadUserProfile()
+
+        if (profile == null) {
+            working.clearUserProfile()
+        } else {
+            working.putUserProfile(profile, USER_PROFILE_MEMORY_SOURCE)
+        }
+
+        return profile
+    }
+}
 
 /** Builds a human-readable dump of all memory layers for the CLI. */
 class MemoryStatusFormatter {
@@ -310,11 +568,21 @@ class MemoryStatusFormatter {
             appendMap("context", memory.working.context())
             appendMap("intermediateResults", memory.working.results())
             appendMap("flags", memory.working.flags().mapValues { it.value.toString() })
+            appendUserProfile(
+                label = "loadedUserProfile",
+                profile = memory.working.userProfile(),
+                source = memory.working.userProfileSource(),
+            )
             appendLine()
             appendLine("LongTermMemory (пользователь: ${longTerm.userId}, JSON)")
             appendLine("createdAt: ${longTerm.createdAt}")
             appendLine("updatedAt: ${longTerm.updatedAt}")
-            appendMap("profile", longTerm.profile)
+            appendUserProfile(
+                label = USER_PROFILE_MEMORY_KEY,
+                profile = memory.longTerm.loadUserProfile(),
+                source = USER_PROFILE_MEMORY_SOURCE,
+            )
+            appendMap("profile", longTerm.profile - USER_PROFILE_MEMORY_KEY)
             appendMap("decisions", longTerm.decisions)
             appendMap("knowledge", longTerm.knowledge)
         }.trimEnd()
@@ -343,6 +611,24 @@ class MemoryStatusFormatter {
             appendLine("    $key = $value")
         }
     }
+
+    private fun StringBuilder.appendUserProfile(
+        label: String,
+        profile: UserProfile?,
+        source: String?,
+    ) {
+        appendLine("  $label:")
+
+        if (profile == null) {
+            appendLine("    (не загружен)")
+            return
+        }
+
+        appendLine("    source = ${source ?: "(неизвестно)"}")
+        profile.toDisplayText().lines().forEach { line ->
+            appendLine("    $line")
+        }
+    }
 }
 
 private fun LongTermMemorySnapshot.toJson(): JSONObject {
@@ -356,13 +642,31 @@ private fun LongTermMemorySnapshot.toJson(): JSONObject {
 }
 
 private fun WorkingMemorySnapshot.toJson(): JSONObject {
-    return JSONObject()
+    val json = JSONObject()
         .put("userId", userId)
         .put("createdAt", createdAt)
         .put("updatedAt", updatedAt)
         .put("context", context.toJsonObject())
         .put("intermediateResults", intermediateResults.toJsonObject())
         .put("flags", flags.toBooleanJsonObject())
+
+    loadedUserProfile?.let { profile ->
+        json.put("loadedUserProfile", profile.toJsonObject())
+    }
+    userProfileSource?.let { source ->
+        json.put("userProfileSource", source)
+    }
+
+    return json
+}
+
+private fun UserProfile.toJsonObject(): JSONObject {
+    return JSONObject()
+        .put("tone", tone.name)
+        .put("gender", gender.name)
+        .put("length", length.name)
+        .put("language", language)
+        .put("notes", notes)
 }
 
 private fun Map<String, String>.toJsonObject(): JSONObject {
