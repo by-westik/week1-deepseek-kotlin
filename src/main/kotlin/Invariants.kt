@@ -132,8 +132,9 @@ sealed class Invariant(
 
             if (blockedMarker == null && taskContext?.isAcceptingTaskInput() == true) {
                 val taskInputMarker = TASK_INPUT_MARKERS.firstOrNull { it in normalized }
+                val lifecycleMarker = TASK_LIFECYCLE_MARKERS.firstOrNull { it in normalized }
 
-                if (taskInputMarker != null) {
+                if (taskInputMarker != null || lifecycleMarker != null) {
                     return null
                 }
             }
@@ -168,6 +169,13 @@ sealed class Invariant(
             "огранич", "услов", "критер", "вводн", "данн",
             "срок", "сумм", "доход", "расход", "трат", "накоп",
             "подушка", "резерв", "приоритет",
+        )
+
+        private val TASK_LIFECYCLE_MARKERS = setOf(
+            "утвержд", "одобр", "соглас", "подтверж",
+            "пропусти", "пропустить", "сразу к", "сразу в", "сразу на",
+            "без плана", "без планирования", "без валидации", "без проверки",
+            "реализац", "финал", "завершай", "закрывай",
         )
 
         private val NON_FINANCE_MARKERS = setOf(

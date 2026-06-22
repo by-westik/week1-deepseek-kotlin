@@ -181,6 +181,17 @@ fun main(args: Array<String>) {
             continue
         }
 
+        val skipStageReason = TaskStateMachine.skipStageViolation(userText, memory.working.currentTask())
+        if (skipStageReason != null) {
+            println(skipStageReason)
+            println()
+            continue
+        }
+
+        if (handleTaskLifecycleText(userText, memory)) {
+            continue
+        }
+
         ensureUserProfileForRequest(memory)
         captureActiveTaskInput(userText, memory)
         captureImplicitMemory(userText, memory)
@@ -507,7 +518,7 @@ private fun handleTaskCommand(
     }
 
     val command = parts.getOrNull(1)?.lowercase()
-        ?: throw IllegalArgumentException("/task ожидает команду start, next, pause, resume, status или done")
+        ?: throw IllegalArgumentException("/task ожидает команду start, approve, next, pause, resume, status или done")
 
     var updatedDialogStats = dialogStats
     val answer = when (command) {
@@ -542,6 +553,12 @@ private fun handleTaskCommand(
             transition.message
         }
 
+        "approve" -> {
+            val transition = TaskStateMachine.approvePlan(memory.working.currentTaskOrError())
+            memory.working.putCurrentTask(transition.context)
+            transition.message
+        }
+
         "pause" -> {
             val transition = TaskStateMachine.pause(memory.working.currentTaskOrError())
             memory.working.putCurrentTask(transition.context)
@@ -562,11 +579,27 @@ private fun handleTaskCommand(
             transition.message
         }
 
-        else -> throw IllegalArgumentException("/task ожидает команду start, next, pause, resume, status или done")
+        else -> throw IllegalArgumentException("/task ожидает команду start, approve, next, pause, resume, status или done")
     }
 
     recordCommandResult(answer)
     return TaskCommandResult(handled = true, dialogStats = updatedDialogStats)
+}
+
+private fun handleTaskLifecycleText(
+    input: String,
+    memory: AssistantMemory,
+): Boolean {
+    val task = memory.working.currentTask() ?: return false
+    val transition = TaskStateMachine.approvePlanFromText(input, task) ?: return false
+
+    memory.working.putCurrentTask(transition.context)
+    memory.shortTerm.add(ChatMessage(role = "user", content = input))
+    memory.shortTerm.add(ChatMessage(role = "assistant", content = transition.message))
+    println(transition.message)
+    println()
+
+    return true
 }
 
 private fun WorkingMemory.currentTaskOrError(): TaskContext {
